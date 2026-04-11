@@ -2,11 +2,17 @@ import asyncio
 import asyncpg
 import sys
 import os
+from urllib.parse import quote_plus
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:Adrdia123.,@@db.uyegbzglcepchhydfoly.supabase.co:5432/postgres")
+
+DB_HOST = os.environ.get("DB_HOST", "db.uyegbzglcepchhydfoly.supabase.co")
+DB_PASS = os.environ.get("DB_PASS", "Adrdia123.,@")
+DB_USER = "postgres"
+DB_NAME = "postgres"
+DB_PORT = 5432
 
 ADMINS = [1275539447, 425680448]
 GROUP_ID = -1003712667390
@@ -18,7 +24,14 @@ db_pool = None
 # ── Base de datos ──────────────────────────────────────────────
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    db_pool = await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        ssl="require"
+    )
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -27,7 +40,6 @@ async def init_db():
                 full_name TEXT
             )
         """)
-        # Por si la tabla ya existía sin las columnas nuevas
         try:
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT")
@@ -119,9 +131,7 @@ async def broadcast_all(bot, message):
 # ── /start ─────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    username = user.username or ""
-    full_name = user.full_name or ""
-    await add_user(user.id, username, full_name)
+    await add_user(user.id, user.username or "", user.full_name or "")
     await update.message.reply_text(
         "✅ *Te has registrado correctamente.*\n\n"
         "Ahora recibirás las apuestas y avisos importantes directamente aquí.\n\n"
@@ -146,7 +156,7 @@ async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ── /lista — ver todos los usuarios ───────────────────────────
+# ── /lista ─────────────────────────────────────────────────────
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
