@@ -9,7 +9,7 @@ TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
 # ── Vosotros dos (añade el ID de tu amigo cuando lo tengas) ──
 ADMINS = [
     1275539447,   # tu ID
-    # 123456789,  # ID de tu amigo — descomenta y pon su ID aquí
+    425680448,  # ID de tu amigo — descomenta y pon su ID aquí
 ]
 
 GROUP_ID = -1001234567890  # Reemplaza con el ID real del grupo (usa /id en el grupo)
