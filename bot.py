@@ -9,7 +9,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
 ADMIN_ID = 1275539447
 GROUP_ID = -1001234567890  # Reemplaza con tu GROUP_ID real (usa /id en el grupo)
-BOT_USERNAME = "tu_bot"   # Reemplaza con el username de tu bot (sin @)
+BOT_USERNAME = "CharmelionBot"   # Reemplaza con el username de tu bot (sin @)
 
 # ── Base de datos ──────────────────────────────────────────────
 conn = sqlite3.connect("users.db", check_same_thread=False)
