@@ -62,7 +62,7 @@ async def broadcast_all(bot, message):
     enviados = 0
     fallidos = 0
     tanda_size = 5
-    espera = 30
+    espera = 120
     num_tanda = 1
 
     await notify_admins(bot, f"📤 *Iniciando envío*\n\n👥 Total usuarios: *{total}*\n📦 Tandas de 5 cada 30 segundos")
