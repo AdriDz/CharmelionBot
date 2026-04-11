@@ -1,5 +1,6 @@
 import sqlite3
 import asyncio
+import sys
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import threading
@@ -9,7 +10,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
 ADMIN_ID = 1275539447
 GROUP_ID = -1001234567890  # Reemplaza con tu GROUP_ID real (usa /id en el grupo)
-BOT_USERNAME = "CharmelionBot"   # Reemplaza con el username de tu bot (sin @)
+BOT_USERNAME = "CharmelionBot"  # Reemplaza con el username de tu bot (sin @)
 
 # ── Base de datos ──────────────────────────────────────────────
 conn = sqlite3.connect("users.db", check_same_thread=False)
@@ -34,7 +35,6 @@ def get_users():
 
 # ── Comandos del bot ───────────────────────────────────────────
 
-# /start — registra al usuario
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     add_user(user_id)
@@ -42,18 +42,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Te has registrado correctamente.\nAhora recibirás los avisos importantes."
     )
 
-# /total — usuarios registrados (solo admin)
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     users = get_users()
     await update.message.reply_text(f"👥 Usuarios registrados: {len(users)}")
 
-# /id — muestra el ID del chat actual
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 ID de este chat: {update.effective_chat.id}")
 
-# /broadcast <mensaje> — manda mensaje privado a todos (no reenvíable)
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ No autorizado")
@@ -65,14 +62,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _broadcast_message(context.bot, message)
     await update.message.reply_text("✅ Mensaje enviado a todos los usuarios")
 
-# /anuncio — manda botón de registro al grupo
 async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await _send_group_register_button(context.bot)
     await update.message.reply_text("✅ Botón de registro enviado al grupo")
 
-# /sendgroup <mensaje> — manda mensaje al grupo (no reenvíable)
 async def sendgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -90,21 +85,19 @@ async def sendgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Funciones auxiliares ───────────────────────────────────────
 
 async def _broadcast_message(bot, message):
-    """Manda un mensaje privado a todos los usuarios registrados."""
     users = get_users()
     for user_id in users:
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=message,
-                protect_content=True  # 🔒 No se puede reenviar
+                protect_content=True
             )
             await asyncio.sleep(0.08)
         except:
             pass
 
 async def _send_group_register_button(bot):
-    """Manda al grupo un mensaje con botón inline para abrir el bot."""
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "📲 Pulsa aquí para registrarte",
@@ -119,14 +112,14 @@ async def _send_group_register_button(bot):
         ),
         parse_mode="Markdown",
         reply_markup=keyboard,
-        protect_content=False  # El botón sí puede compartirse
+        protect_content=False
     )
 
-# ── Flask API (para el panel web) ─────────────────────────────
+# ── Flask API ─────────────────────────────────────────────────
 
 flask_app = Flask(__name__)
 CORS(flask_app)
-bot_app = None  # Se asigna al iniciar
+bot_app = None
 
 @flask_app.route("/api/broadcast", methods=["POST"])
 def api_broadcast():
@@ -180,9 +173,8 @@ def run_flask():
 # ── Arranque ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-import sys
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     app = ApplicationBuilder().token(TOKEN).build()
     bot_app = app
@@ -194,7 +186,6 @@ if sys.platform == "win32":
     app.add_handler(CommandHandler("anuncio",   anuncio))
     app.add_handler(CommandHandler("sendgroup", sendgroup))
 
-    # Flask en hilo separado
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
