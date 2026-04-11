@@ -36,28 +36,31 @@ def get_users():
     cursor.execute("SELECT user_id FROM users")
     return [row[0] for row in cursor.fetchall()]
 
-# ── Helpers ────────────────────────────────────────────────────
-
 def is_admin(update: Update):
     return update.effective_user.id in ADMINS
 
 async def notify_admins(bot, message):
-    """Manda un mensaje a todos los admins."""
     for admin_id in ADMINS:
         try:
             await bot.send_message(chat_id=admin_id, text=message, parse_mode="Markdown")
         except:
             pass
 
+# ── Broadcast con bucle y reporte por tanda ───────────────────
 async def broadcast_all(bot, message):
     users = get_users()
+    total = len(users)
     enviados = 0
     fallidos = 0
     tanda_size = 5
-    espera = 30  # 30 segundos entre tandas
+    espera = 30  # segundos entre tandas
+    num_tanda = 1
 
-    for i in range(0, len(users), tanda_size):
+    await notify_admins(bot, f"📤 *Iniciando envío*\n\n👥 Total usuarios: *{total}*\n📦 Tandas de 5 cada 30 segundos")
+
+    for i in range(0, total, tanda_size):
         tanda = users[i:i + tanda_size]
+
         for user_id in tanda:
             try:
                 await bot.send_message(
@@ -67,10 +70,31 @@ async def broadcast_all(bot, message):
                 )
                 enviados += 1
                 await asyncio.sleep(0.3)
-            except Exception:
+            except:
                 fallidos += 1
-        if i + tanda_size < len(users):
+
+        # Reporte de esta tanda a los admins
+        await notify_admins(
+            bot,
+            f"📦 *Tanda {num_tanda} completada*\n\n"
+            f"✅ Enviados hasta ahora: *{enviados}*\n"
+            f"❌ Fallidos: *{fallidos}*\n"
+            f"📊 Progreso: *{enviados + fallidos}/{total}*"
+        )
+        num_tanda += 1
+
+        # Si quedan más usuarios, espera 30 segundos
+        if i + tanda_size < total:
             await asyncio.sleep(espera)
+
+    # Resumen final
+    await notify_admins(
+        bot,
+        f"🏁 *Broadcast completado*\n\n"
+        f"✅ Enviados: *{enviados}*\n"
+        f"❌ Fallidos: *{fallidos}*\n"
+        f"👥 Total: *{total}*"
+    )
 
     return enviados, fallidos
 
@@ -112,17 +136,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = " ".join(context.args)
     users = get_users()
     await update.message.reply_text(
-        f"⏳ Enviando a *{len(users)}* usuarios en tandas de 5 cada 30 segundos...",
+        f"⏳ Iniciando envío a *{len(users)}* usuarios...",
         parse_mode="Markdown"
     )
-    enviados, fallidos = await broadcast_all(context.bot, message)
-    resumen = (
-        f"✅ *Broadcast completado*\n\n"
-        f"📨 Enviados: *{enviados}*\n"
-        f"❌ Fallidos: *{fallidos}*\n"
-        f"👥 Total: *{len(users)}*"
-    )
-    await update.message.reply_text(resumen, parse_mode="Markdown")
+    await broadcast_all(context.bot, message)
 
 # ── Mensaje directo ────────────────────────────────────────────
 async def mensaje_directo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,17 +148,10 @@ async def mensaje_directo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message.text
     users = get_users()
     await update.message.reply_text(
-        f"⏳ Enviando a *{len(users)}* usuarios en tandas de 5 cada 30 segundos...",
+        f"⏳ Iniciando envío a *{len(users)}* usuarios...",
         parse_mode="Markdown"
     )
-    enviados, fallidos = await broadcast_all(context.bot, message)
-    resumen = (
-        f"✅ *Broadcast completado*\n\n"
-        f"📨 Enviados: *{enviados}*\n"
-        f"❌ Fallidos: *{fallidos}*\n"
-        f"👥 Total: *{len(users)}*"
-    )
-    await update.message.reply_text(resumen, parse_mode="Markdown")
+    await broadcast_all(context.bot, message)
 
 # ── /anuncio ───────────────────────────────────────────────────
 async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,11 +211,11 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ── Aviso de arranque a los admins ────────────────────────────
+# ── Aviso arranque ─────────────────────────────────────────────
 async def on_startup(app):
     await notify_admins(
         app.bot,
-        "🟢 *Bot iniciado correctamente*\n\nEl bot está activo y listo para recibir mensajes."
+        "🟢 *Bot iniciado correctamente*\n\nEl bot está activo y listo."
     )
 
 # ── Arranque ───────────────────────────────────────────────────
