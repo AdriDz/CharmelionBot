@@ -12,7 +12,7 @@ ADMINS = [
     425680448,  # ID de tu amigo — descomenta y pon su ID aquí
 ]
 
-GROUP_ID = -1001234567890  # Reemplaza con el ID real del grupo (usa /id en el grupo)
+GROUP_ID = -1003712667390  # Reemplaza con el ID real del grupo (usa /id en el grupo)
 BOT_USERNAME = "CharmelionBot"  # Sin @
 
 CANAL_LINK = "https://t.me/TU_CANAL"  # Reemplaza con el link de tu canal
