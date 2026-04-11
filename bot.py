@@ -6,16 +6,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
 
-# ── Vosotros dos (añade el ID de tu amigo cuando lo tengas) ──
 ADMINS = [
-    1275539447,   # tu ID
-    425680448,  # ID de tu amigo — descomenta y pon su ID aquí
+    1275539447,
+    425680448,
 ]
 
-GROUP_ID = -1003712667390  # Reemplaza con el ID real del grupo (usa /id en el grupo)
-BOT_USERNAME = "CharmelionBot"  # Sin @
-
-CANAL_LINK = "https://t.me/TU_CANAL"  # Reemplaza con el link de tu canal
+GROUP_ID = -1003712667390
+BOT_USERNAME = "CharmelionBot"
+CANAL_LINK = "https://t.me/TU_CANAL"
 
 # ── Base de datos ──────────────────────────────────────────────
 conn = sqlite3.connect("users.db", check_same_thread=False)
@@ -46,20 +44,28 @@ def is_admin(update: Update):
 async def broadcast_all(bot, message):
     users = get_users()
     enviados = 0
-    for user_id in users:
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=message,
-                protect_content=True  # 🔒 No se puede reenviar
-            )
-            enviados += 1
-            await asyncio.sleep(0.08)
-        except:
-            pass
+    tanda_size = 5       # personas por tanda
+    espera = 120         # segundos entre tandas (2 minutos)
+
+    for i in range(0, len(users), tanda_size):
+        tanda = users[i:i + tanda_size]
+        for user_id in tanda:
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    protect_content=True
+                )
+                enviados += 1
+                await asyncio.sleep(0.08)
+            except:
+                pass
+        if i + tanda_size < len(users):
+            await asyncio.sleep(espera)
+
     return enviados
 
-# ── /start — cualquier persona puede registrarse ───────────────
+# ── /start ─────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     add_user(user_id)
@@ -70,18 +76,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ── /id — muestra el ID del chat ───────────────────────────────
+# ── /id ────────────────────────────────────────────────────────
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 ID de este chat: `{update.effective_chat.id}`", parse_mode="Markdown")
 
-# ── /total — usuarios registrados (solo admins) ────────────────
+# ── /total ─────────────────────────────────────────────────────
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     users = get_users()
     await update.message.reply_text(f"👥 Usuarios registrados: *{len(users)}*", parse_mode="Markdown")
 
-# ── /broadcast — manda mensaje a todos (solo admins) ──────────
+# ── /broadcast ─────────────────────────────────────────────────
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -89,20 +95,22 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usa: /broadcast mensaje")
         return
     message = " ".join(context.args)
-    await update.message.reply_text("⏳ Enviando...")
+    users = get_users()
+    await update.message.reply_text(f"⏳ Enviando en tandas de 5 cada 2 min a {len(users)} usuarios...")
     enviados = await broadcast_all(context.bot, message)
     await update.message.reply_text(f"✅ Enviado a *{enviados}* usuarios", parse_mode="Markdown")
 
-# ── Mensaje directo — cualquier texto del admin se manda a todos
+# ── Mensaje directo ────────────────────────────────────────────
 async def mensaje_directo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        return  # ignora completamente a los demás
+        return
     message = update.message.text
-    await update.message.reply_text("⏳ Enviando a todos los usuarios...")
+    users = get_users()
+    await update.message.reply_text(f"⏳ Enviando en tandas de 5 cada 2 min a {len(users)} usuarios...")
     enviados = await broadcast_all(context.bot, message)
     await update.message.reply_text(f"✅ Enviado a *{enviados}* usuarios", parse_mode="Markdown")
 
-# ── /anuncio — botón de registro al grupo (solo admins) ───────
+# ── /anuncio ───────────────────────────────────────────────────
 async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -111,10 +119,7 @@ async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📲 Regístrate para recibir las apuestas",
             url=f"https://t.me/{BOT_USERNAME}?start=registro"
         )],
-        [InlineKeyboardButton(
-            "📢 Ir al canal",
-            url=CANAL_LINK
-        )]
+        [InlineKeyboardButton("📢 Ir al canal", url=CANAL_LINK)]
     ])
     await context.bot.send_message(
         chat_id=GROUP_ID,
@@ -128,7 +133,7 @@ async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text("✅ Anuncio enviado al grupo")
 
-# ── /patrocinar — mensaje de patrocinio al grupo (solo admins) ─
+# ── /patrocinar ────────────────────────────────────────────────
 async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -147,13 +152,13 @@ async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text("✅ Mensaje de patrocinio enviado")
 
-# ── /ayuda — lista de comandos (solo admins) ──────────────────
+# ── /ayuda ─────────────────────────────────────────────────────
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     await update.message.reply_text(
         "📋 *Comandos disponibles:*\n\n"
-        "✉️ *Escribir cualquier mensaje* → se manda a todos los registrados\n"
+        "✉️ *Escribir cualquier mensaje* → se manda a todos en tandas de 5\n"
         "/broadcast mensaje → igual que escribir directamente\n"
         "/anuncio → manda botón de registro al grupo\n"
         "/patrocinar → manda mensaje de patrocinio al grupo\n"
@@ -178,7 +183,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("patrocinar", patrocinar))
     app.add_handler(CommandHandler("ayuda",      ayuda))
 
-    # Cualquier mensaje de texto del admin se manda a todos
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_directo))
 
     print("🤖 Bot corriendo...")
