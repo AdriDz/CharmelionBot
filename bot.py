@@ -1,5 +1,6 @@
 import asyncio
 import asyncpg
+import random
 import sys
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -56,8 +57,16 @@ async def notify_admins(bot, message):
         except:
             pass
 
+async def notify_batch_admin(bot, message):
+    # Solo el segundo admin recibe las notificaciones de tandas
+    try:
+        await bot.send_message(chat_id=ADMINS[1], text=message, parse_mode="Markdown")
+    except:
+        pass
+
 async def broadcast_all(bot, message):
-    users = await get_users()
+    users = list(await get_users())
+    random.shuffle(users)  # Orden aleatorio en cada envío
     total = len(users)
     enviados = 0
     fallidos = 0
@@ -83,7 +92,7 @@ async def broadcast_all(bot, message):
                 nombres_fail.append(f"❌ {format_user(row)}")
 
         lista = "\n".join(nombres_ok + nombres_fail)
-        await notify_admins(bot,
+        await notify_batch_admin(bot,
             f"📦 *Tanda {num_tanda}*\n\n{lista}\n\n📊 Progreso: *{enviados + fallidos}/{total}*"
         )
         num_tanda += 1
