@@ -9,7 +9,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-ADMINS = [1275539447, 425680448]
+ADMINS = [425680448]
 GROUP_ID = -1003712667390
 BOT_USERNAME = "CharmelionBot"
 CANAL_LINK = "https://t.me/TU_CANAL"
@@ -42,6 +42,10 @@ async def get_users():
     async with db_pool.acquire() as conn:
         return await conn.fetch("SELECT user_id, username, full_name FROM users")
 
+async def delete_all_users():
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM users")
+
 def is_admin(update: Update):
     return update.effective_user.id in ADMINS
 
@@ -58,7 +62,6 @@ async def notify_admins(bot, message):
             pass
 
 async def notify_batch_admin(bot, message):
-    # Solo el segundo admin recibe las notificaciones de tandas
     try:
         await bot.send_message(chat_id=ADMINS[1], text=message, parse_mode="Markdown")
     except:
@@ -66,7 +69,7 @@ async def notify_batch_admin(bot, message):
 
 async def broadcast_all(bot, message):
     users = list(await get_users())
-    random.shuffle(users)  # Orden aleatorio en cada envío
+    random.shuffle(users)
     total = len(users)
     enviados = 0
     fallidos = 0
@@ -169,6 +172,25 @@ async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=keyboard)
     await update.message.reply_text("✅ Mensaje de patrocinio enviado")
 
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    # Solo el primer admin puede hacer el reset
+    if update.effective_user.id != ADMINS[0]:
+        await update.message.reply_text("⛔ No tienes permiso para ejecutar este comando.")
+        return
+    users = await get_users()
+    total_antes = len(users)
+    await delete_all_users()
+    await update.message.reply_text(
+        f"🗑️ *Base de datos limpiada*\n\n"
+        f"Se han eliminado *{total_antes}* usuarios.\n"
+        f"El bot está listo para un nuevo mes.",
+        parse_mode="Markdown"
+    )
+    await notify_admins(update.get_bot(),
+        f"🗑️ *Reset ejecutado*\n\nSe han eliminado *{total_antes}* usuarios de la base de datos."
+    )
+
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     await update.message.reply_text(
@@ -179,6 +201,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/patrocinar → manda mensaje de patrocinio al grupo\n"
         "/total → ver cuántos usuarios registrados\n"
         "/lista → ver todos los usuarios con nombre\n"
+        "/reset → eliminar todos los usuarios de la base de datos\n"
         "/id → ver el ID de un chat\n"
         "/ayuda → ver esta lista",
         parse_mode="Markdown"
@@ -200,6 +223,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("broadcast",  broadcast))
     app.add_handler(CommandHandler("anuncio",    anuncio))
     app.add_handler(CommandHandler("patrocinar", patrocinar))
+    app.add_handler(CommandHandler("reset",      reset))
     app.add_handler(CommandHandler("ayuda",      ayuda))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje_directo))
 
