@@ -165,10 +165,8 @@ async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Mensaje enviado")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Solo admins pueden hacer reset
     if not is_admin(update): return
-    if update.effective_user.id != ADMINS[1]:
-        await update.message.reply_text("⛔ No tienes permiso para ejecutar este comando.")
-        return
     users = await get_users()
     total_antes = len(users)
     await delete_all_users()
