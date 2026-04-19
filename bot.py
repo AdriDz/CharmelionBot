@@ -58,7 +58,7 @@ async def ejecutar_broadcast_en_fondo(bot, message):
     enviados = 0
     fallidos = 0
     tanda_size = 5
-    espera = 30 # Segundos entre tandas
+    espera = 120 # Segundos entre tandas
     
     await bot.send_message(chat_id=ADMINS[0], text=f"🚀 *Iniciando nuevo envío:*\n{message[:50]}...")
 
