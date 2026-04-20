@@ -12,7 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 TOKEN = "8623515567:AAFzx6xKFA-WSUQzDc5AkfpwZC3MICB6eJw"
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-ADMINS = [425680448]
+ADMINS = [1275539447, 425680448]
 GROUP_ID = -1003712667390
 BOT_USERNAME = "CharmelionBot"
 CANAL_LINK = "https://t.me/TU_CANAL"
