@@ -53,7 +53,11 @@ async def delete_all_users():
 def format_user(row):
     return f"{row['full_name'] or 'Sin nombre'} (@{row['username'] or 'sin @'})"
 
-def is_admin(update: Update): return update.effective_user.id in ADMINS
+# FIX: comprobar que effective_user no es None
+def is_admin(update: Update):
+    if not update.effective_user:
+        return False
+    return update.effective_user.id in ADMINS
 
 async def notify_admins(bot, message):
     for admin_id in ADMINS:
@@ -101,9 +105,14 @@ async def broadcast_logic(bot, msg, broadcast_id):
             await asyncio.sleep(0.3)
 
         lista = "\n".join(nombres_ok + nombres_fail)
-        await notify_admins(bot,
-            f"📦 *Broadcast #{broadcast_id} — Tanda {i // tanda_size + 1}*\n\n{lista}\n\n📊 Progreso: *{enviados + fallidos}/{total}*"
-        )
+        # Sin parse_mode para evitar errores con caracteres especiales del mensaje
+        for admin_id in ADMINS:
+            try:
+                await bot.send_message(chat_id=admin_id,
+                    text=f"📦 Broadcast #{broadcast_id} — Tanda {i // tanda_size + 1}\n\n{lista}\n\n📊 Progreso: {enviados + fallidos}/{total}"
+                )
+            except:
+                pass
 
         if i + tanda_size < total:
             await asyncio.sleep(espera)
@@ -165,7 +174,6 @@ async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Mensaje enviado")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Solo admins pueden hacer reset
     if not is_admin(update): return
     users = await get_users()
     total_antes = len(users)
