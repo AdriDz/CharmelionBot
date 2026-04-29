@@ -3,6 +3,8 @@ import asyncpg
 import random
 import sys
 import os
+import secrets
+from datetime import date, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -31,16 +33,18 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
-                full_name TEXT
+                full_name TEXT,
+                expiry DATE
             )
         """)
-
-async def add_user(user_id, username, full_name):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""INSERT INTO users (user_id, username, full_name)
-                             VALUES ($1, $2, $3)
-                             ON CONFLICT (user_id) DO UPDATE
-                             SET username = $2, full_name = $3""", user_id, username, full_name)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS codes (
+                code TEXT PRIMARY KEY,
+                used BOOLEAN DEFAULT FALSE,
+                used_by BIGINT,
+                expiry DATE
+            )
+        """)
 
 async def get_users():
     async with db_pool.acquire() as conn:
@@ -50,10 +54,39 @@ async def delete_all_users():
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM users")
 
+async def is_user_active(user_id):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id = $1", user_id)
+        if not row or not row["expiry"]:
+            return False
+        return row["expiry"] >= date.today()
+
+async def create_code(conn, days=31):
+    code = secrets.token_hex(4).upper()
+    expiry = date.today() + timedelta(days=days)
+    await conn.execute(
+        "INSERT INTO codes (code, used, expiry) VALUES ($1, FALSE, $2)",
+        code, expiry
+    )
+    return code, expiry
+
+async def use_code(conn, code, user_id):
+    row = await conn.fetchrow("SELECT * FROM codes WHERE code = $1", code)
+    if not row:
+        return None, "❌ Código inválido."
+    if row["used"]:
+        return None, "❌ Código ya usado."
+    if row["expiry"] < date.today():
+        return None, "❌ Código caducado."
+    await conn.execute(
+        "UPDATE codes SET used = TRUE, used_by = $1 WHERE code = $2",
+        user_id, code
+    )
+    return row["expiry"], None
+
 def format_user(row):
     return f"{row['full_name'] or 'Sin nombre'} (@{row['username'] or 'sin @'})"
 
-# FIX: comprobar que effective_user no es None
 def is_admin(update: Update):
     if not update.effective_user:
         return False
@@ -67,7 +100,7 @@ async def notify_admins(bot, message):
             pass
 
 # ========================
-# LÓGICA DE ENVÍO EN PARALELO
+# BROADCAST
 # ========================
 async def broadcast_logic(bot, msg, broadcast_id):
     users = list(await get_users())
@@ -105,7 +138,6 @@ async def broadcast_logic(bot, msg, broadcast_id):
             await asyncio.sleep(0.3)
 
         lista = "\n".join(nombres_ok + nombres_fail)
-        # Sin parse_mode para evitar errores con caracteres especiales del mensaje
         for admin_id in ADMINS:
             try:
                 await bot.send_message(chat_id=admin_id,
@@ -134,8 +166,80 @@ async def encolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await add_user(user.id, user.username or "", user.full_name or "")
-    await update.message.reply_text("✅ *Te has registrado correctamente.*", parse_mode="Markdown")
+
+    # Si ya tiene acceso activo
+    if await is_user_active(user.id):
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id = $1", user.id)
+        await update.message.reply_text(
+            f"✅ *Ya tienes acceso activo.*\n\n📅 Tu acceso expira el *{row['expiry'].strftime('%d/%m/%Y')}*",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Si no pasa código
+    if not context.args:
+        await update.message.reply_text(
+            "🔐 *Acceso restringido.*\n\n"
+            "Necesitas un código de acceso para registrarte.\n\n"
+            "Usa: `/start TUCODIGO`",
+            parse_mode="Markdown"
+        )
+        return
+
+    code = context.args[0].upper()
+    async with db_pool.acquire() as conn:
+        expiry, error = await use_code(conn, code, user.id)
+        if error:
+            await update.message.reply_text(error)
+            return
+        await conn.execute("""
+            INSERT INTO users (user_id, username, full_name, expiry)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username=$2, full_name=$3, expiry=$4
+        """, user.id, user.username or "", user.full_name or "", expiry)
+
+    await update.message.reply_text(
+        f"✅ *¡Acceso concedido!*\n\n"
+        f"📅 Tu acceso es válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
+        f"A partir de ahora recibirás los avisos directamente aquí. 🔔",
+        parse_mode="Markdown"
+    )
+    await notify_admins(context.bot,
+        f"🆕 *Nuevo usuario registrado*\n\n"
+        f"👤 {user.full_name or 'Sin nombre'} (@{user.username or 'sin @'})\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"📅 Acceso hasta: *{expiry.strftime('%d/%m/%Y')}*"
+    )
+
+async def generar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    cantidad = int(context.args[0]) if context.args else 1
+    dias = int(context.args[1]) if len(context.args) > 1 else 31
+    async with db_pool.acquire() as conn:
+        codigos = []
+        for _ in range(cantidad):
+            code, expiry = await create_code(conn, days=dias)
+            codigos.append(f"`{code}` — válido hasta {expiry.strftime('%d/%m/%Y')}")
+    await update.message.reply_text(
+        f"🎟️ *{cantidad} código(s) generado(s) por {dias} días:*\n\n" + "\n".join(codigos),
+        parse_mode="Markdown"
+    )
+
+async def codigos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT code, used, used_by, expiry FROM codes ORDER BY expiry DESC")
+    if not rows:
+        await update.message.reply_text("No hay códigos generados.")
+        return
+    lines = []
+    for r in rows:
+        estado = f"✅ Usado por `{r['used_by']}`" if r["used"] else "🟡 Disponible"
+        lines.append(f"`{r['code']}` — {estado} — caduca {r['expiry'].strftime('%d/%m/%Y')}")
+    text = "🎟️ *Códigos:*\n\n" + "\n".join(lines)
+    await update.message.reply_text(text[:4000], parse_mode="Markdown")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 ID: `{update.effective_chat.id}`", parse_mode="Markdown")
@@ -143,15 +247,29 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     users = await get_users()
-    await update.message.reply_text(f"👥 Usuarios: *{len(users)}*", parse_mode="Markdown")
+    # Contar activos
+    activos = 0
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT expiry FROM users")
+        activos = sum(1 for r in rows if r["expiry"] and r["expiry"] >= date.today())
+    await update.message.reply_text(
+        f"👥 Total usuarios: *{len(users)}*\n✅ Activos: *{activos}*\n❌ Caducados: *{len(users) - activos}*",
+        parse_mode="Markdown"
+    )
 
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    users = await get_users()
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id, username, full_name, expiry FROM users")
     if not users:
         await update.message.reply_text("No hay usuarios registrados aún.")
         return
-    text = "👥 *Usuarios registrados:*\n\n" + "\n".join([f"• {format_user(r)}" for r in users])
+    lines = []
+    for r in users:
+        estado = "✅" if r["expiry"] and r["expiry"] >= date.today() else "❌"
+        exp = r["expiry"].strftime('%d/%m/%Y') if r["expiry"] else "sin fecha"
+        lines.append(f"{estado} {format_user(r)} — {exp}")
+    text = "👥 *Usuarios:*\n\n" + "\n".join(lines)
     await update.message.reply_text(text[:4000], parse_mode="Markdown")
 
 async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,22 +302,24 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"El bot está listo para un nuevo mes.",
         parse_mode="Markdown"
     )
-    await notify_admins(context.bot,
-        f"🗑️ *Reset ejecutado*\n\nSe han eliminado *{total_antes}* usuarios."
-    )
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     await update.message.reply_text(
         "📋 *Comandos disponibles:*\n\n"
         "✉️ *Escribir cualquier mensaje* → broadcast en paralelo\n"
-        "🖼️ *Foto/vídeo/documento* → también se manda a todos\n"
-        "📊 *Cada broadcast tiene su número* para identificarlo\n\n"
+        "🖼️ *Foto/vídeo/documento* → también se manda a todos\n\n"
+        "🎟️ *Gestión de accesos:*\n"
+        "/generar N D → genera N códigos de D días (ej: `/generar 5 31`)\n"
+        "/codigos → ver todos los códigos y su estado\n\n"
+        "📊 *Usuarios:*\n"
+        "/total → total y activos/caducados\n"
+        "/lista → ver todos los usuarios con estado\n"
+        "/reset → eliminar todos los usuarios\n\n"
+        "📢 *Canal:*\n"
         "/anuncio → manda botón de registro al grupo\n"
-        "/patrocinar → manda mensaje de patrocinio\n"
-        "/total → ver cuántos usuarios registrados\n"
-        "/lista → ver todos los usuarios\n"
-        "/reset → eliminar todos los usuarios\n"
+        "/patrocinar → manda mensaje de patrocinio\n\n"
+        "🔧 *Otros:*\n"
         "/id → ver el ID de un chat\n"
         "/ayuda → ver esta lista",
         parse_mode="Markdown"
@@ -225,6 +345,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("patrocinar", patrocinar))
     app.add_handler(CommandHandler("reset",      reset))
     app.add_handler(CommandHandler("ayuda",      ayuda))
+    app.add_handler(CommandHandler("generar",    generar))
+    app.add_handler(CommandHandler("codigos",    codigos))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, encolar))
 
     print("🤖 Bot corriendo...")
