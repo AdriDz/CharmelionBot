@@ -38,6 +38,9 @@ async def init_db():
             )
         """)
         await conn.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS expiry DATE
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 code TEXT PRIMARY KEY,
                 used BOOLEAN DEFAULT FALSE,
@@ -47,8 +50,17 @@ async def init_db():
         """)
 
 async def get_users():
+    """Devuelve usuarios activos (expiry vigente O sin expiry = usuarios de antes del sistema de códigos)"""
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT user_id, username, full_name FROM users")
+        return await conn.fetch("""
+            SELECT user_id, username, full_name FROM users
+            WHERE expiry IS NULL OR expiry >= $1
+        """, date.today())
+
+async def get_all_users():
+    """Devuelve todos los usuarios sin filtrar (para /lista y /total)"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, username, full_name, expiry FROM users")
 
 async def delete_all_users():
     async with db_pool.acquire() as conn:
@@ -57,8 +69,11 @@ async def delete_all_users():
 async def is_user_active(user_id):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id = $1", user_id)
-        if not row or not row["expiry"]:
+        if not row:
             return False
+        # Sin expiry = usuario antiguo de abril, se considera activo hasta el reset
+        if not row["expiry"]:
+            return True
         return row["expiry"] >= date.today()
 
 async def create_code(conn, days=31):
@@ -100,10 +115,10 @@ async def notify_admins(bot, message):
             pass
 
 # ========================
-# BROADCAST
+# BROADCAST (solo usuarios activos)
 # ========================
 async def broadcast_logic(bot, msg, broadcast_id):
-    users = list(await get_users())
+    users = list(await get_users())  # Solo activos
     random.shuffle(users)
     total = len(users)
     enviados = 0
@@ -112,7 +127,7 @@ async def broadcast_logic(bot, msg, broadcast_id):
     espera = 120
 
     await notify_admins(bot,
-        f"🚀 *Broadcast #{broadcast_id} iniciado* ({total} usuarios)\n📦 Tandas de 5 cada 2 minutos"
+        f"🚀 *Broadcast #{broadcast_id} iniciado* ({total} usuarios activos)\n📦 Tandas de 5 cada 2 minutos"
     )
 
     for i in range(0, total, tanda_size):
@@ -167,17 +182,16 @@ async def encolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # Si ya tiene acceso activo
     if await is_user_active(user.id):
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id = $1", user.id)
+        exp_text = row["expiry"].strftime('%d/%m/%Y') if row["expiry"] else "este mes"
         await update.message.reply_text(
-            f"✅ *Ya tienes acceso activo.*\n\n📅 Tu acceso expira el *{row['expiry'].strftime('%d/%m/%Y')}*",
+            f"✅ *Ya tienes acceso activo.*\n\n📅 Tu acceso expira el *{exp_text}*",
             parse_mode="Markdown"
         )
         return
 
-    # Si no pasa código
     if not context.args:
         await update.message.reply_text(
             "🔐 *Acceso restringido.*\n\n"
@@ -246,28 +260,24 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    users = await get_users()
-    # Contar activos
-    activos = 0
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT expiry FROM users")
-        activos = sum(1 for r in rows if r["expiry"] and r["expiry"] >= date.today())
+    users = await get_all_users()
+    activos = sum(1 for r in users if not r["expiry"] or r["expiry"] >= date.today())
+    caducados = len(users) - activos
     await update.message.reply_text(
-        f"👥 Total usuarios: *{len(users)}*\n✅ Activos: *{activos}*\n❌ Caducados: *{len(users) - activos}*",
+        f"👥 Total usuarios: *{len(users)}*\n✅ Activos: *{activos}*\n❌ Caducados: *{caducados}*",
         parse_mode="Markdown"
     )
 
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    async with db_pool.acquire() as conn:
-        users = await conn.fetch("SELECT user_id, username, full_name, expiry FROM users")
+    users = await get_all_users()
     if not users:
         await update.message.reply_text("No hay usuarios registrados aún.")
         return
     lines = []
     for r in users:
-        estado = "✅" if r["expiry"] and r["expiry"] >= date.today() else "❌"
-        exp = r["expiry"].strftime('%d/%m/%Y') if r["expiry"] else "sin fecha"
+        estado = "✅" if not r["expiry"] or r["expiry"] >= date.today() else "❌"
+        exp = r["expiry"].strftime('%d/%m/%Y') if r["expiry"] else "abril (sin código)"
         lines.append(f"{estado} {format_user(r)} — {exp}")
     text = "👥 *Usuarios:*\n\n" + "\n".join(lines)
     await update.message.reply_text(text[:4000], parse_mode="Markdown")
@@ -293,7 +303,7 @@ async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    users = await get_users()
+    users = await get_all_users()
     total_antes = len(users)
     await delete_all_users()
     await update.message.reply_text(
