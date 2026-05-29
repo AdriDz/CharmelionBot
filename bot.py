@@ -264,12 +264,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(
-        "🔐 *Acceso restringido.*\n\n"
-        "Para acceder necesitas ser miembro del canal VIP.\n\n"
-        "Contacta con el admin para más información.",
-        parse_mode="Markdown"
-    )
+    # Verificar en tiempo real si está en el grupo premium
+    try:
+        member = await context.bot.get_chat_member(GROUP_ID, user.id)
+        en_grupo = member.status in ("member", "administrator", "creator")
+    except Exception:
+        en_grupo = False
+
+    if en_grupo:
+        expiry = date.today() + timedelta(days=31)
+        await register_user(user, expiry)
+        await update.message.reply_text(
+            f"✅ *¡Registrado correctamente!*\n\n"
+            f"📅 Tu acceso es válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
+            f"Recibirás los avisos aquí directamente. 🔔",
+            parse_mode="Markdown"
+        )
+        await notify_admins(context.bot,
+            f"🆕 *Nuevo registro vía /start*\n\n"
+            f"👤 {user.full_name or 'Sin nombre'} (@{user.username or 'sin @'})\n"
+            f"🆔 ID: `{user.id}`\n"
+            f"📅 Acceso hasta: *{expiry.strftime('%d/%m/%Y')}*"
+        )
+    else:
+        await update.message.reply_text(
+            "🔐 *Acceso restringido.*\n\n"
+            "Para acceder necesitas ser miembro del canal VIP.\n\n"
+            "Contacta con el admin para más información.",
+            parse_mode="Markdown"
+        )
 
 async def generar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
