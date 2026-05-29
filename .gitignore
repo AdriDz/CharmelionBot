@@ -1,2 +1,5 @@
-importar_miembros.py
-sesion_importar.session
+*.db
+*.sqlite
+__pycache__/
+*.pyc
+.env
