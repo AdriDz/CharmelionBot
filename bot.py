@@ -13,7 +13,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cha
 # ========================
 TOKEN = os.environ.get("TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ADMINS = [425680448]
+ADMINS = [int(os.environ.get("ADMIN_ID"))]
 GROUP_ID = int(os.environ.get("GROUP_ID"))
 BOT_USERNAME = "CharmelionBot"
 CANAL_LINK = "https://t.me/TU_CANAL"
