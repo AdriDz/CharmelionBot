@@ -6,7 +6,7 @@ import os
 import secrets
 from datetime import date, timedelta, datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
 
 # ========================
 # CONFIGURACIÓN
@@ -17,6 +17,7 @@ ADMINS = [int(os.environ.get("ADMIN_ID"))]
 GROUP_ID = int(os.environ.get("GROUP_ID"))
 BOT_USERNAME = "CharmelionBot"
 CANAL_LINK = "https://t.me/TU_CANAL"
+DEVELOPER_ID = int(os.environ.get("DEVELOPER_ID", "0"))
 
 db_pool = None
 
@@ -132,6 +133,56 @@ async def notify_admins(bot, message):
             await bot.send_message(chat_id=admin_id, text=message, parse_mode="Markdown")
         except:
             pass
+
+# ========================
+# DETECCIÓN CAMBIO DE CANAL (para el desarrollador)
+# ========================
+async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global GROUP_ID
+    result = update.my_chat_member
+    if not result or not DEVELOPER_ID:
+        return
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+    chat = result.chat
+
+    if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Sí, cambiar", callback_data=f"setgroup_{chat.id}"),
+            InlineKeyboardButton("❌ No", callback_data="setgroup_no")
+        ]])
+        await context.bot.send_message(
+            chat_id=DEVELOPER_ID,
+            text=f"➕ *Bot añadido a un nuevo grupo*\n\n"
+                 f"📛 *{chat.title}*\n🆔 `{chat.id}`\n\n"
+                 f"¿Establecer como canal activo?",
+            parse_mode="Markdown", reply_markup=kb
+        )
+    elif old_status in ("member", "administrator") and new_status in ("left", "kicked"):
+        await context.bot.send_message(
+            chat_id=DEVELOPER_ID,
+            text=f"⚠️ *Bot eliminado de un grupo*\n\n📛 *{chat.title}*\n🆔 `{chat.id}`",
+            parse_mode="Markdown"
+        )
+
+async def confirmar_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global GROUP_ID
+    query = update.callback_query
+    await query.answer()
+    if query.data == "setgroup_no":
+        await query.edit_message_text("❌ Sin cambios.")
+        return
+    new_id = int(query.data.split("_")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO config (key, value) VALUES ('group_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+            str(new_id)
+        )
+    GROUP_ID = new_id
+    await query.edit_message_text(
+        f"✅ *Canal activo actualizado*\n\n🆔 Nuevo ID: `{new_id}`",
+        parse_mode="Markdown"
+    )
 
 # ========================
 # AVISO AUTOMÁTICO 3 DÍAS ANTES DE EXPIRAR
@@ -552,7 +603,12 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_startup(app):
+    global GROUP_ID
     await init_db()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM config WHERE key = 'group_id'")
+        if row:
+            GROUP_ID = int(row["value"])
     asyncio.create_task(daily_expiry_check(app.bot))
     await notify_admins(app.bot, "🟢 *Bot iniciado correctamente*\n\nEl bot está activo y listo.")
 
@@ -562,6 +618,8 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TOKEN).post_init(on_startup).build()
     app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(mi_estado,    ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CallbackQueryHandler(confirmar_grupo, pattern="^setgroup_"))
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("activar",     activar))
     app.add_handler(CommandHandler("id",          get_id))
