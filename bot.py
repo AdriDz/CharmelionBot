@@ -1,5 +1,6 @@
 import asyncio
 import asyncpg
+import aiohttp
 import random
 import sys
 import os
@@ -18,6 +19,12 @@ GROUP_ID = int(os.environ.get("GROUP_ID"))
 BOT_USERNAME = "CharmelionBot"
 CANAL_LINK = "https://t.me/TU_CANAL"
 DEVELOPER_ID = int(os.environ.get("DEVELOPER_ID", "0"))
+RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "")
+
+RAILWAY_GQL        = "https://backboard.railway.app/graphql/v2"
+RAILWAY_PROJECT_ID = "ef71ce9f-941b-4922-97c5-46f93227ddee"
+RAILWAY_SERVICE_ID = "7ad95008-3c7f-45fa-91c3-cbd88d76845d"
+RAILWAY_ENV_ID     = "6dc80a9b-4f78-4499-ac4b-2f85945eb7d9"
 
 db_pool = None
 
@@ -165,6 +172,32 @@ async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+async def railway_update_group_id(new_id: int) -> bool:
+    mutation = """
+    mutation variableUpsert($input: VariableUpsertInput!) {
+      variableUpsert(input: $input)
+    }
+    """
+    payload = {
+        "query": mutation,
+        "variables": {"input": {
+            "projectId":     RAILWAY_PROJECT_ID,
+            "environmentId": RAILWAY_ENV_ID,
+            "serviceId":     RAILWAY_SERVICE_ID,
+            "name":          "GROUP_ID",
+            "value":         str(new_id),
+        }},
+    }
+    headers = {"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(RAILWAY_GQL, json=payload, headers=headers) as resp:
+                data = await resp.json()
+                return "errors" not in data
+    except Exception as e:
+        print(f"Error Railway API: {e}")
+        return False
+
 async def confirmar_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global GROUP_ID
     query = update.callback_query
@@ -172,15 +205,17 @@ async def confirmar_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "setgroup_no":
         await query.edit_message_text("❌ Sin cambios.")
         return
-    new_id = int(query.data.split("_")[1])
+    new_id = int(query.data.removeprefix("setgroup_"))
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO config (key, value) VALUES ('group_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
             str(new_id)
         )
     GROUP_ID = new_id
+    railway_ok = await railway_update_group_id(new_id)
+    estado = "✅ Variable Railway actualizada" if railway_ok else "⚠️ Railway no actualizado (revisa RAILWAY_TOKEN)"
     await query.edit_message_text(
-        f"✅ *Canal activo actualizado*\n\n🆔 Nuevo ID: `{new_id}`",
+        f"✅ *Canal activo actualizado*\n\n🆔 Nuevo ID: `{new_id}`\n{estado}",
         parse_mode="Markdown"
     )
 
