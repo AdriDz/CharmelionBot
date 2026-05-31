@@ -633,7 +633,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("codigos",     codigos_cmd))
     app.add_handler(CommandHandler("extender",    extender))
     app.add_handler(CommandHandler("expulsar",    expulsar))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, encolar))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND, encolar))
 
     print("🤖 Bot corriendo...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
