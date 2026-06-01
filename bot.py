@@ -1,32 +1,48 @@
+"""
+PLANTILLA DE BOT — Canal VIP de Telegram (con menú de botones).
+
+Bot autoconfigurable que se despliega para cada cliente. Cuando el cliente lo añade
+como admin a su grupo, detecta solo el grupo y el admin. Todo se maneja con botones,
+menos difundir un mensaje (para eso se le escribe el mensaje directamente).
+
+Variables de entorno:
+  TOKEN, DATABASE_URL, GROUP_ID, ADMIN_ID, DEVELOPER_ID,
+  RAILWAY_TOKEN, RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID, RAILWAY_ENV_ID
+"""
 import asyncio
 import asyncpg
 import aiohttp
 import random
 import sys
 import os
-import secrets
 from datetime import date, timedelta, datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ChatMemberHandler, filters, ContextTypes
+from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+                          MessageHandler, ChatMemberHandler, filters, ContextTypes)
 
 # ========================
 # CONFIGURACIÓN
 # ========================
-TOKEN = os.environ.get("TOKEN")
+TOKEN        = os.environ.get("TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-ADMINS = [int(os.environ.get("ADMIN_ID"))]
-GROUP_ID = int(os.environ.get("GROUP_ID"))
-BOT_USERNAME = "CharmelionBot"
-CANAL_LINK = "https://t.me/TU_CANAL"
+GROUP_ID     = int(os.environ.get("GROUP_ID", "0"))
+ADMIN_ID     = int(os.environ.get("ADMIN_ID", "0"))
 DEVELOPER_ID = int(os.environ.get("DEVELOPER_ID", "0"))
-RAILWAY_TOKEN = os.environ.get("RAILWAY_TOKEN", "")
 
+RAILWAY_TOKEN      = os.environ.get("RAILWAY_TOKEN", "")
 RAILWAY_GQL        = "https://backboard.railway.app/graphql/v2"
-RAILWAY_PROJECT_ID = "ef71ce9f-941b-4922-97c5-46f93227ddee"
-RAILWAY_SERVICE_ID = "7ad95008-3c7f-45fa-91c3-cbd88d76845d"
-RAILWAY_ENV_ID     = "6dc80a9b-4f78-4499-ac4b-2f85945eb7d9"
+RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID", "")
+RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "")
+RAILWAY_ENV_ID     = os.environ.get("RAILWAY_ENV_ID", "")
 
+ADMINS = [ADMIN_ID] if ADMIN_ID else []
+BOT_USERNAME = ""   # se rellena al arrancar
 db_pool = None
+
+# Estado de la difusión en curso (para poder pararla)
+_difusion_activa = False
+_difusion_cancelar = False
+
 
 # ========================
 # BASE DE DATOS
@@ -38,637 +54,571 @@ async def init_db():
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                expiry DATE
-            )
-        """)
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS expiry DATE")
+                username TEXT, full_name TEXT, expiry DATE
+            )""")
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS codes (
-                code TEXT PRIMARY KEY,
-                used BOOLEAN DEFAULT FALSE,
-                used_by BIGINT,
-                expiry DATE
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
+            CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
         await conn.execute("""
             INSERT INTO config (key, value) VALUES ('broadcast_counter', '0')
-            ON CONFLICT (key) DO NOTHING
-        """)
+            ON CONFLICT (key) DO NOTHING""")
+
+
+async def cfg_get(key):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM config WHERE key = $1", key)
+        return row["value"] if row else None
+
+
+async def cfg_set(key, value):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO config (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = $2""", key, str(value))
+
 
 async def next_broadcast_id():
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "UPDATE config SET value = (value::int + 1)::text WHERE key = 'broadcast_counter' RETURNING value"
-        )
+            "UPDATE config SET value=(value::int+1)::text WHERE key='broadcast_counter' RETURNING value")
         return int(row["value"])
+
 
 async def get_users():
     async with db_pool.acquire() as conn:
-        return await conn.fetch("""
-            SELECT user_id, username, full_name FROM users
-            WHERE expiry IS NULL OR expiry >= $1
-        """, date.today())
+        return await conn.fetch(
+            "SELECT user_id, username, full_name FROM users WHERE expiry IS NULL OR expiry >= $1",
+            date.today())
+
 
 async def get_all_users():
     async with db_pool.acquire() as conn:
         return await conn.fetch("SELECT user_id, username, full_name, expiry FROM users")
 
-async def delete_all_users():
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM users")
 
 async def is_user_active(user_id):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id = $1", user_id)
         if not row:
             return False
-        if not row["expiry"]:
-            return True
-        return row["expiry"] >= date.today()
+        return row["expiry"] is None or row["expiry"] >= date.today()
+
 
 async def register_user(user, expiry):
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO users (user_id, username, full_name, expiry)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id) DO UPDATE
-            SET username=$2, full_name=$3, expiry=$4
-        """, user.id, user.username or "", user.full_name or "", expiry)
+            INSERT INTO users (user_id, username, full_name, expiry) VALUES ($1,$2,$3,$4)
+            ON CONFLICT (user_id) DO UPDATE SET username=$2, full_name=$3, expiry=$4""",
+            user.id, user.username or "", user.full_name or "", expiry)
 
-async def create_code(conn, days=31):
-    code = secrets.token_hex(4).upper()
-    expiry = date.today() + timedelta(days=days)
-    await conn.execute(
-        "INSERT INTO codes (code, used, expiry) VALUES ($1, FALSE, $2)",
-        code, expiry
-    )
-    return code, expiry
-
-async def use_code(conn, code, user_id):
-    row = await conn.fetchrow("SELECT * FROM codes WHERE code = $1", code)
-    if not row:
-        return None, "❌ Código inválido."
-    if row["used"]:
-        return None, "❌ Código ya usado."
-    if row["expiry"] < date.today():
-        return None, "❌ Código caducado."
-    await conn.execute(
-        "UPDATE codes SET used = TRUE, used_by = $1 WHERE code = $2",
-        user_id, code
-    )
-    return row["expiry"], None
 
 def format_user(row):
     return f"{row['full_name'] or 'Sin nombre'} (@{row['username'] or 'sin @'})"
 
-def is_admin(update: Update):
-    if not update.effective_user:
-        return False
-    return update.effective_user.id in ADMINS
 
-async def notify_admins(bot, message):
+def is_admin(update: Update):
+    u = update.effective_user
+    return u and u.id in ADMINS
+
+
+async def notify_admins(bot, message, reply_markup=None):
     for admin_id in ADMINS:
         try:
-            await bot.send_message(chat_id=admin_id, text=message, parse_mode="Markdown")
-        except:
+            await bot.send_message(chat_id=admin_id, text=message,
+                                   parse_mode="Markdown", reply_markup=reply_markup)
+        except Exception:
             pass
 
-# ========================
-# DETECCIÓN CAMBIO DE CANAL (para el desarrollador)
-# ========================
-async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global GROUP_ID
-    result = update.my_chat_member
-    if not result or not DEVELOPER_ID:
-        return
-    old_status = result.old_chat_member.status
-    new_status = result.new_chat_member.status
-    chat = result.chat
 
-    if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Sí, cambiar", callback_data=f"setgroup_{chat.id}"),
-            InlineKeyboardButton("❌ No", callback_data="setgroup_no")
-        ]])
-        await context.bot.send_message(
-            chat_id=DEVELOPER_ID,
-            text=f"➕ *Bot añadido a un nuevo grupo*\n\n"
-                 f"📛 *{chat.title}*\n🆔 `{chat.id}`\n\n"
-                 f"¿Establecer como canal activo?",
-            parse_mode="Markdown", reply_markup=kb
-        )
-    elif old_status in ("member", "administrator") and new_status in ("left", "kicked"):
-        await context.bot.send_message(
-            chat_id=DEVELOPER_ID,
-            text=f"⚠️ *Bot eliminado de un grupo*\n\n📛 *{chat.title}*\n🆔 `{chat.id}`",
-            parse_mode="Markdown"
-        )
-
-async def railway_update_group_id(new_id: int) -> bool:
-    mutation = """
-    mutation variableUpsert($input: VariableUpsertInput!) {
-      variableUpsert(input: $input)
-    }
-    """
-    payload = {
-        "query": mutation,
-        "variables": {"input": {
-            "projectId":     RAILWAY_PROJECT_ID,
-            "environmentId": RAILWAY_ENV_ID,
-            "serviceId":     RAILWAY_SERVICE_ID,
-            "name":          "GROUP_ID",
-            "value":         str(new_id),
-        }},
-    }
+# ========================
+# RAILWAY: auto-guardar variables
+# ========================
+async def railway_set_var(name: str, value: str) -> bool:
+    if not (RAILWAY_TOKEN and RAILWAY_PROJECT_ID and RAILWAY_SERVICE_ID and RAILWAY_ENV_ID):
+        return False
+    mutation = "mutation variableUpsert($input: VariableUpsertInput!) { variableUpsert(input: $input) }"
+    payload = {"query": mutation, "variables": {"input": {
+        "projectId": RAILWAY_PROJECT_ID, "environmentId": RAILWAY_ENV_ID,
+        "serviceId": RAILWAY_SERVICE_ID, "name": name, "value": str(value)}}}
     headers = {"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(RAILWAY_GQL, json=payload, headers=headers) as resp:
-                data = await resp.json()
-                return "errors" not in data
-    except Exception as e:
-        print(f"Error Railway API: {e}")
+        async with aiohttp.ClientSession() as s:
+            async with s.post(RAILWAY_GQL, json=payload, headers=headers, timeout=30) as r:
+                return "errors" not in await r.json()
+    except Exception:
         return False
 
-async def confirmar_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global GROUP_ID
-    query = update.callback_query
-    await query.answer()
-    if query.data == "setgroup_no":
-        await query.edit_message_text("❌ Sin cambios.")
-        return
-    new_id = int(query.data.removeprefix("setgroup_"))
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO config (key, value) VALUES ('group_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
-            str(new_id)
-        )
-    GROUP_ID = new_id
-    railway_ok = await railway_update_group_id(new_id)
-    estado = "✅ Variable Railway actualizada" if railway_ok else "⚠️ Railway no actualizado (revisa RAILWAY_TOKEN)"
-    await query.edit_message_text(
-        f"✅ *Canal activo actualizado*\n\n🆔 Nuevo ID: `{new_id}`\n{estado}",
-        parse_mode="Markdown"
-    )
+
+async def railway_reiniciar_self() -> bool:
+    """Reinicia (redeploy) este mismo bot en Railway."""
+    if not (RAILWAY_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENV_ID):
+        return False
+    mutation = ("mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) "
+                "{ serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }")
+    payload = {"query": mutation, "variables": {
+        "serviceId": RAILWAY_SERVICE_ID, "environmentId": RAILWAY_ENV_ID}}
+    headers = {"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(RAILWAY_GQL, json=payload, headers=headers, timeout=30) as r:
+                return "errors" not in await r.json()
+    except Exception:
+        return False
+
 
 # ========================
-# AVISO AUTOMÁTICO 3 DÍAS ANTES DE EXPIRAR
+# MENÚ DE BOTONES
+# ========================
+def menu_principal():
+    filas = [
+        [InlineKeyboardButton("👥 Mis usuarios", callback_data="usuarios")],
+        [InlineKeyboardButton("📢 Anuncio de registro", callback_data="anuncio")],
+        [InlineKeyboardButton("📣 Difundir un mensaje", callback_data="difundir")],
+    ]
+    # Si hay una difusión en marcha, mostrar el botón para pararla
+    if _difusion_activa:
+        filas.append([InlineKeyboardButton("⏹️ PARAR difusión", callback_data="parar")])
+    filas += [
+        [InlineKeyboardButton("🗑️ Vaciar usuarios", callback_data="vaciar")],
+        [InlineKeyboardButton("🔄 Reiniciar bot",   callback_data="reiniciar")],
+        [InlineKeyboardButton("❓ Cómo funciona",   callback_data="ayuda")],
+    ]
+    return InlineKeyboardMarkup(filas)
+
+
+def boton_volver():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Menú", callback_data="menu")]])
+
+
+TEXTO_MENU = (
+    "🤖 *Panel de control*\n\n"
+    "Elige una opción 👇\n"
+    "_Todo se maneja con los botones. Para difundir un mensaje, pulsa «Difundir» "
+    "y escríbeme lo que quieras enviar._"
+)
+
+
+# ========================
+# AUTOCONFIGURACIÓN al añadir el bot como admin
+# ========================
+async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global GROUP_ID, ADMIN_ID, ADMINS
+    result = update.my_chat_member
+    if not result:
+        return
+    old = result.old_chat_member.status
+    new = result.new_chat_member.status
+    chat = result.chat
+    quien = result.from_user
+
+    if old in ("left", "kicked") and new in ("member", "administrator"):
+        GROUP_ID = chat.id
+        await cfg_set("group_id", chat.id)
+        await railway_set_var("GROUP_ID", chat.id)
+
+        if ADMIN_ID == 0 and quien:
+            ADMIN_ID = quien.id
+            ADMINS = [ADMIN_ID]
+            await cfg_set("admin_id", quien.id)
+            await railway_set_var("ADMIN_ID", quien.id)
+
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(f"✅ *¡Bot configurado!*\n\n📛 Grupo: *{chat.title}*\n\n"
+                          f"Ya está todo listo. Aquí tienes tu panel 👇"),
+                    parse_mode="Markdown", reply_markup=menu_principal())
+            except Exception:
+                pass
+
+        if DEVELOPER_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=DEVELOPER_ID,
+                    text=(f"🟢 *Bot activado por cliente*\n📛 {chat.title}\n"
+                          f"🆔 `{chat.id}`\n👤 Admin: `{ADMIN_ID}`"),
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+    elif old in ("member", "administrator") and new in ("left", "kicked"):
+        if DEVELOPER_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=DEVELOPER_ID,
+                    text=f"⚠️ *Bot eliminado de un grupo*\n📛 {chat.title}",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+
+# ========================
+# AVISO 3 DÍAS ANTES DE EXPIRAR
 # ========================
 async def daily_expiry_check(bot):
     while True:
         now = datetime.now()
         next_run = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
-
         target = date.today() + timedelta(days=3)
         async with db_pool.acquire() as conn:
             users = await conn.fetch("SELECT user_id, expiry FROM users WHERE expiry = $1", target)
-
         for u in users:
             try:
                 await bot.send_message(
                     chat_id=u["user_id"],
-                    text=f"⚠️ *Tu acceso expira en 3 días*\n\n"
-                         f"📅 Fecha: *{u['expiry'].strftime('%d/%m/%Y')}*\n\n"
-                         f"Contacta con el admin para renovar tu acceso.",
-                    parse_mode="Markdown"
-                )
-            except:
+                    text=(f"⚠️ *Tu acceso expira en 3 días*\n\n"
+                          f"📅 Fecha: *{u['expiry'].strftime('%d/%m/%Y')}*\n\n"
+                          f"Contacta con el admin para renovar."),
+                    parse_mode="Markdown")
+            except Exception:
                 pass
 
+
 # ========================
-# DETECCIÓN AUTOMÁTICA DE NUEVOS MIEMBROS
+# NUEVOS MIEMBROS
 # ========================
 async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.chat_member
-    if not result:
+    if not result or result.chat.id != GROUP_ID:
         return
-    if result.chat.id != GROUP_ID:
-        return
-
-    old_status = result.old_chat_member.status
-    new_status = result.new_chat_member.status
+    old = result.old_chat_member.status
+    new = result.new_chat_member.status
     user = result.new_chat_member.user
-
     if user.is_bot:
         return
 
-    if old_status in ("left", "kicked") and new_status == "member":
+    if old in ("left", "kicked") and new == "member":
         expiry = date.today() + timedelta(days=31)
         await register_user(user, expiry)
         try:
             await context.bot.send_message(
                 chat_id=user.id,
-                text=f"✅ *¡Bienvenido al VIP!*\n\n"
-                     f"📅 Tu acceso es válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
-                     f"A partir de ahora recibirás los avisos aquí directamente. 🔔",
-                parse_mode="Markdown"
-            )
-        except:
+                text=(f"✅ *¡Bienvenido al VIP!*\n\n"
+                      f"📅 Acceso válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
+                      f"Recibirás los avisos aquí directamente. 🔔"),
+                parse_mode="Markdown")
+        except Exception:
             pass
         await notify_admins(context.bot,
-            f"🆕 *Nuevo miembro registrado*\n\n"
-            f"👤 {user.full_name or 'Sin nombre'} (@{user.username or 'sin @'})\n"
-            f"🆔 ID: `{user.id}`\n"
-            f"📅 Acceso hasta: *{expiry.strftime('%d/%m/%Y')}*"
-        )
+            f"🆕 *Nuevo miembro*\n👤 {user.full_name} (@{user.username or 'sin @'})\n"
+            f"🆔 `{user.id}`\n📅 Hasta: *{expiry.strftime('%d/%m/%Y')}*")
 
-    elif old_status == "member" and new_status in ("left", "kicked"):
+    elif old == "member" and new in ("left", "kicked"):
         async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET expiry = $1 WHERE user_id = $2",
-                date.today() - timedelta(days=1), user.id
-            )
-        try:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text="❌ *Has salido del canal VIP.*\n\n"
-                     "Tu acceso al bot ha sido desactivado.\n"
-                     "Si crees que es un error, contacta con el admin.",
-                parse_mode="Markdown"
-            )
-        except:
-            pass
+            await conn.execute("UPDATE users SET expiry=$1 WHERE user_id=$2",
+                               date.today() - timedelta(days=1), user.id)
         await notify_admins(context.bot,
-            f"🚪 *Miembro salido/expulsado*\n\n"
-            f"👤 {user.full_name or 'Sin nombre'} (@{user.username or 'sin @'})\n"
-            f"🆔 ID: `{user.id}`\n"
-            f"❌ Acceso desactivado"
-        )
+            f"🚪 *Miembro salido*\n👤 {user.full_name} (@{user.username or 'sin @'})\n🆔 `{user.id}`")
+
 
 # ========================
 # BROADCAST
 # ========================
+async def _espera_cancelable(segundos):
+    """Espera troceada que se corta si se pide cancelar la difusión."""
+    for _ in range(int(segundos)):
+        if _difusion_cancelar:
+            return
+        await asyncio.sleep(1)
+
+
 async def broadcast_logic(bot, msg, broadcast_id):
+    global _difusion_activa, _difusion_cancelar
+    _difusion_activa = True
+    _difusion_cancelar = False
     users = list(await get_users())
     random.shuffle(users)
     total = len(users)
-    enviados = 0
-    fallidos = 0
-    tanda_size = 5
-    espera = 180
+    enviados = fallidos = 0
+    tanda_size, espera = 5, 180
 
     await notify_admins(bot,
-        f"🚀 *Broadcast #{broadcast_id} iniciado* ({total} usuarios activos)\n📦 Tandas de 5 cada 3 minutos"
-    )
+        f"🚀 *Difusión #{broadcast_id} iniciada* ({total} activos)\n📦 Tandas de 5 cada 3 min\n"
+        f"_Puedes pararla desde el menú con «Parar difusión»._")
 
     for i in range(0, total, tanda_size):
+        if _difusion_cancelar:
+            await notify_admins(bot,
+                f"⏹️ *Difusión #{broadcast_id} detenida.*\n✅ Enviados: *{enviados}* de {total}")
+            _difusion_activa = False
+            return
         tanda = users[i:i + tanda_size]
-        nombres_ok = []
-        nombres_fail = []
-
+        ok, fail = [], []
         for row in tanda:
+            if _difusion_cancelar:
+                break
             try:
                 uid = row["user_id"]
                 if msg.photo:
-                    await bot.send_photo(chat_id=uid, photo=msg.photo[-1].file_id, caption=msg.caption, protect_content=True)
+                    await bot.send_photo(uid, msg.photo[-1].file_id, caption=msg.caption, protect_content=True)
                 elif msg.video:
-                    await bot.send_video(chat_id=uid, video=msg.video.file_id, caption=msg.caption, protect_content=True)
+                    await bot.send_video(uid, msg.video.file_id, caption=msg.caption, protect_content=True)
                 elif msg.document:
-                    await bot.send_document(chat_id=uid, document=msg.document.file_id, caption=msg.caption, protect_content=True)
+                    await bot.send_document(uid, msg.document.file_id, caption=msg.caption, protect_content=True)
                 elif msg.audio:
-                    await bot.send_audio(chat_id=uid, audio=msg.audio.file_id, caption=msg.caption, protect_content=True)
+                    await bot.send_audio(uid, msg.audio.file_id, caption=msg.caption, protect_content=True)
                 elif msg.voice:
-                    await bot.send_voice(chat_id=uid, voice=msg.voice.file_id, caption=msg.caption, protect_content=True)
+                    await bot.send_voice(uid, msg.voice.file_id, caption=msg.caption, protect_content=True)
                 elif msg.sticker:
-                    await bot.send_sticker(chat_id=uid, sticker=msg.sticker.file_id, protect_content=True)
+                    await bot.send_sticker(uid, msg.sticker.file_id, protect_content=True)
                 elif msg.animation:
-                    await bot.send_animation(chat_id=uid, animation=msg.animation.file_id, caption=msg.caption, protect_content=True)
+                    await bot.send_animation(uid, msg.animation.file_id, caption=msg.caption, protect_content=True)
                 elif msg.text:
-                    await bot.send_message(chat_id=uid, text=msg.text, protect_content=True)
+                    await bot.send_message(uid, msg.text, protect_content=True)
                 enviados += 1
-                nombres_ok.append(f"✅ {format_user(row)}")
-            except:
+                ok.append(f"✅ {format_user(row)}")
+            except Exception:
                 fallidos += 1
-                nombres_fail.append(f"❌ {format_user(row)}")
+                fail.append(f"❌ {format_user(row)}")
             await asyncio.sleep(0.3)
 
-        lista_tanda = "\n".join(nombres_ok + nombres_fail)
         for admin_id in ADMINS:
             try:
-                await bot.send_message(chat_id=admin_id,
-                    text=f"📦 Broadcast #{broadcast_id} — Tanda {i // tanda_size + 1}\n\n{lista_tanda}\n\n📊 Progreso: {enviados + fallidos}/{total}"
-                )
-            except:
+                await bot.send_message(admin_id,
+                    f"📦 #{broadcast_id} — Tanda {i // tanda_size + 1}\n\n" +
+                    "\n".join(ok + fail) + f"\n\n📊 {enviados + fallidos}/{total}")
+            except Exception:
                 pass
-
         if i + tanda_size < total:
-            await asyncio.sleep(espera)
+            await _espera_cancelable(espera)
 
-    await notify_admins(bot,
-        f"🏁 *Broadcast #{broadcast_id} finalizado*\n✅ Enviados: *{enviados}*\n❌ Fallidos: *{fallidos}*\n👥 Total: *{total}*"
-    )
+    _difusion_activa = False
+    if _difusion_cancelar:
+        await notify_admins(bot,
+            f"⏹️ *Difusión #{broadcast_id} detenida.*\n✅ Enviados: *{enviados}* de {total}")
+    else:
+        await notify_admins(bot,
+            f"🏁 *Difusión #{broadcast_id} finalizada*\n✅ {enviados} | ❌ {fallidos} | 👥 {total}")
 
-async def encolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    bid = await next_broadcast_id()
-    asyncio.create_task(broadcast_logic(context.bot, update.message, bid))
-    await update.message.reply_text(f"🚀 *Broadcast #{bid} lanzado en paralelo*", parse_mode="Markdown")
 
 # ========================
-# COMANDOS
+# /start  (admin → menú ; usuario → registro)
 # ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    if await is_user_active(user.id):
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id = $1", user.id)
-        exp_text = row["expiry"].strftime('%d/%m/%Y') if row["expiry"] else "este mes"
-        await update.message.reply_text(
-            f"✅ *Ya tienes acceso activo.*\n\n📅 Tu acceso expira el *{exp_text}*",
-            parse_mode="Markdown"
-        )
+    # Admin → panel de botones
+    if user.id in ADMINS:
+        await update.message.reply_text(TEXTO_MENU, parse_mode="Markdown",
+                                        reply_markup=menu_principal())
         return
 
-    try:
-        member = await context.bot.get_chat_member(GROUP_ID, user.id)
-        en_grupo = member.status in ("member", "administrator", "creator")
-    except Exception:
-        en_grupo = False
+    # Usuario normal → intentar registrarlo si está en el grupo
+    if await is_user_active(user.id):
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id=$1", user.id)
+        exp = row["expiry"].strftime('%d/%m/%Y') if row and row["expiry"] else "este mes"
+        await update.message.reply_text(
+            f"✅ *Ya tienes acceso activo.*\n\n📅 Expira el *{exp}*", parse_mode="Markdown")
+        return
+
+    en_grupo = False
+    if GROUP_ID:
+        try:
+            member = await context.bot.get_chat_member(GROUP_ID, user.id)
+            en_grupo = member.status in ("member", "administrator", "creator")
+        except Exception:
+            en_grupo = False
 
     if en_grupo:
         expiry = date.today() + timedelta(days=31)
         await register_user(user, expiry)
         await update.message.reply_text(
-            f"✅ *¡Registrado correctamente!*\n\n"
-            f"📅 Tu acceso es válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
-            f"Recibirás los avisos aquí directamente. 🔔",
-            parse_mode="Markdown"
-        )
-        await notify_admins(context.bot,
-            f"🆕 *Nuevo registro vía /start*\n\n"
-            f"👤 {user.full_name or 'Sin nombre'} (@{user.username or 'sin @'})\n"
-            f"🆔 ID: `{user.id}`\n"
-            f"📅 Acceso hasta: *{expiry.strftime('%d/%m/%Y')}*"
-        )
+            f"✅ *¡Registrado correctamente!*\n\n📅 Acceso hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
+            f"A partir de ahora recibirás los avisos aquí. 🔔", parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            "🔐 *Acceso restringido.*\n\n"
-            "Para acceder necesitas ser miembro del canal VIP.\n\n"
-            "Contacta con el admin para más información.",
-            parse_mode="Markdown"
-        )
+            "🔐 *Acceso restringido.*\n\nNecesitas ser miembro del canal VIP para registrarte.",
+            parse_mode="Markdown")
 
-async def activar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not context.args:
-        await update.message.reply_text("Uso: `/activar CODIGO`", parse_mode="Markdown")
-        return
-    code = context.args[0].upper()
-    async with db_pool.acquire() as conn:
-        expiry, error = await use_code(conn, code, user.id)
-    if error:
-        await update.message.reply_text(error)
-        return
-    await register_user(user, expiry)
-    await update.message.reply_text(
-        f"✅ *Código activado correctamente.*\n\n"
-        f"📅 Tu acceso es válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
-        f"Recibirás los avisos aquí directamente. 🔔",
-        parse_mode="Markdown"
-    )
-    await notify_admins(context.bot,
-        f"🎟️ *Código activado*\n\n"
-        f"👤 {user.full_name or 'Sin nombre'} (@{user.username or 'sin @'})\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"📅 Acceso hasta: *{expiry.strftime('%d/%m/%Y')}*"
-    )
 
-async def generar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    cantidad = int(context.args[0]) if context.args else 1
-    dias = int(context.args[1]) if len(context.args) > 1 else 31
-    async with db_pool.acquire() as conn:
-        codigos = []
-        for _ in range(cantidad):
-            code, expiry = await create_code(conn, days=dias)
-            codigos.append(f"`{code}` — válido hasta {expiry.strftime('%d/%m/%Y')}")
-    await update.message.reply_text(
-        f"🎟️ *{cantidad} código(s) generado(s) por {dias} días:*\n\n" + "\n".join(codigos),
-        parse_mode="Markdown"
-    )
+# ========================
+# BOTONES (callbacks)
+# ========================
+async def boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id not in ADMINS:
+        return
+    data = query.data
 
-async def codigos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT code, used, used_by, expiry FROM codes ORDER BY expiry DESC")
-    if not rows:
-        await update.message.reply_text("No hay códigos generados.")
-        return
-    lines = []
-    for r in rows:
-        estado = f"✅ Usado por `{r['used_by']}`" if r["used"] else "🟡 Disponible"
-        lines.append(f"`{r['code']}` — {estado} — caduca {r['expiry'].strftime('%d/%m/%Y')}")
-    text = "🎟️ *Códigos:*\n\n" + "\n".join(lines)
-    await update.message.reply_text(text[:4000], parse_mode="Markdown")
+    if data == "menu":
+        context.user_data.pop("esperando", None)
+        await query.edit_message_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
 
-async def extender(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    if len(context.args) < 2:
-        await update.message.reply_text("Uso: `/extender USER_ID DIAS`", parse_mode="Markdown")
-        return
-    try:
-        user_id = int(context.args[0])
-        dias = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ USER_ID y DIAS deben ser números.")
-        return
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT expiry, full_name FROM users WHERE user_id = $1", user_id)
-        if not row:
-            await update.message.reply_text("❌ Usuario no encontrado.")
+    elif data == "usuarios":
+        users = await get_all_users()
+        activos = sum(1 for r in users if not r["expiry"] or r["expiry"] >= date.today())
+        cab = (f"👥 *Tus usuarios*\n\n"
+               f"Total: *{len(users)}*  ·  ✅ Activos: *{activos}*  ·  ❌ Caducados: *{len(users)-activos}*\n\n")
+        if not users:
+            await query.edit_message_text(cab + "_Aún no hay usuarios registrados._",
+                                          parse_mode="Markdown", reply_markup=boton_volver())
             return
-        base = max(row["expiry"], date.today()) if row["expiry"] else date.today()
-        new_expiry = base + timedelta(days=dias)
-        await conn.execute("UPDATE users SET expiry = $1 WHERE user_id = $2", new_expiry, user_id)
-    await update.message.reply_text(
-        f"✅ *Acceso extendido*\n\n"
-        f"👤 {row['full_name'] or user_id}\n"
-        f"📅 Nueva expiración: *{new_expiry.strftime('%d/%m/%Y')}*",
-        parse_mode="Markdown"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"✅ *Tu acceso ha sido renovado.*\n\n"
-                 f"📅 Nuevo acceso hasta: *{new_expiry.strftime('%d/%m/%Y')}*",
-            parse_mode="Markdown"
-        )
-    except:
-        pass
+        lineas = []
+        for r in users[:50]:
+            estado = "✅" if not r["expiry"] or r["expiry"] >= date.today() else "❌"
+            exp = r["expiry"].strftime('%d/%m/%Y') if r["expiry"] else "sin fecha"
+            lineas.append(f"{estado} {format_user(r)} — {exp}")
+        extra = f"\n\n_…y {len(users)-50} más_" if len(users) > 50 else ""
+        await query.edit_message_text(cab + "\n".join(lineas) + extra,
+                                      parse_mode="Markdown", reply_markup=boton_volver())
 
-async def expulsar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    if not context.args:
-        await update.message.reply_text("Uso: `/expulsar USER_ID`", parse_mode="Markdown")
-        return
-    try:
-        user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ USER_ID debe ser un número.")
-        return
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT full_name FROM users WHERE user_id = $1", user_id)
-        if not row:
-            await update.message.reply_text("❌ Usuario no encontrado.")
+    elif data == "anuncio":
+        if not GROUP_ID:
+            await query.edit_message_text(
+                "⚠️ Primero añádeme a tu grupo como administrador.",
+                reply_markup=boton_volver())
             return
-        await conn.execute(
-            "UPDATE users SET expiry = $1 WHERE user_id = $2",
-            date.today() - timedelta(days=1), user_id
-        )
-    await update.message.reply_text(
-        f"✅ Usuario *{row['full_name'] or user_id}* expulsado.\n❌ Acceso desactivado.",
-        parse_mode="Markdown"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="❌ *Tu acceso al bot ha sido desactivado.*\n\n"
-                 "Si crees que es un error, contacta con el admin.",
-            parse_mode="Markdown"
-        )
-    except:
-        pass
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📲 Registrarme en el bot", url=f"https://t.me/{BOT_USERNAME}?start=registro")]])
+        try:
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=("📣 *¿Quieres recibir los avisos directamente en tu privado?*\n\n"
+                      "Pulsa el botón y quedarás registrado en el bot. 🔔"),
+                parse_mode="Markdown", reply_markup=kb)
+            await query.edit_message_text("✅ Anuncio enviado a tu grupo.", reply_markup=boton_volver())
+        except Exception as e:
+            await query.edit_message_text(f"❌ No pude enviarlo: {e}", reply_markup=boton_volver())
 
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🆔 ID: `{update.effective_chat.id}`", parse_mode="Markdown")
+    elif data == "difundir":
+        context.user_data["esperando"] = "broadcast"
+        await query.edit_message_text(
+            "📣 *Difundir un mensaje*\n\nEscríbeme ahora el mensaje que quieres enviar a todos "
+            "tus usuarios. Puede ser texto, foto, vídeo, audio... Lo mando yo en tandas.\n\n"
+            "_(o pulsa Menú para cancelar)_",
+            parse_mode="Markdown", reply_markup=boton_volver())
 
-async def total(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    users = await get_all_users()
-    activos = sum(1 for r in users if not r["expiry"] or r["expiry"] >= date.today())
-    caducados = len(users) - activos
-    await update.message.reply_text(
-        f"👥 Total usuarios: *{len(users)}*\n✅ Activos: *{activos}*\n❌ Caducados: *{caducados}*",
-        parse_mode="Markdown"
-    )
+    elif data == "vaciar":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚠️ Sí, vaciar todo", callback_data="vaciar_ok")],
+            [InlineKeyboardButton("↩️ Cancelar", callback_data="menu")]])
+        await query.edit_message_text(
+            "🗑️ *¿Seguro que quieres borrar TODOS los usuarios?*\n\nEsto no se puede deshacer.",
+            parse_mode="Markdown", reply_markup=kb)
 
-async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    users = await get_all_users()
-    if not users:
-        await update.message.reply_text("No hay usuarios registrados aún.")
+    elif data == "vaciar_ok":
+        users = await get_all_users()
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM users")
+        await query.edit_message_text(
+            f"🗑️ Hecho. Eliminados *{len(users)}* usuarios.", parse_mode="Markdown",
+            reply_markup=boton_volver())
+
+    elif data == "parar":
+        global _difusion_cancelar
+        if _difusion_activa:
+            _difusion_cancelar = True
+            await query.edit_message_text(
+                "⏹️ Parando la difusión... no se enviará a más gente.",
+                reply_markup=boton_volver())
+        else:
+            await query.edit_message_text(
+                "ℹ️ No hay ninguna difusión en marcha ahora mismo.",
+                reply_markup=boton_volver())
+
+    elif data == "reiniciar":
+        await query.edit_message_text("🔄 Reiniciando tu bot... estará listo en ~30 segundos.")
+        ok = await railway_reiniciar_self()
+        msg = ("✅ Bot reiniciado. En unos segundos vuelve a estar activo."
+               if ok else "❌ No pude reiniciar el bot. Avisa al soporte.")
+        await query.edit_message_text(msg, reply_markup=boton_volver())
+
+    elif data == "ayuda":
+        await query.edit_message_text(AYUDA, parse_mode="Markdown", reply_markup=boton_volver())
+
+
+AYUDA = (
+    "❓ *Cómo funciona tu bot*\n\n"
+    "Tu bot gestiona tu canal VIP solo. Esto es lo que hace:\n\n"
+    "👥 *Mis usuarios*\n"
+    "Ve cuánta gente tienes, quién está activo y quién caducó.\n\n"
+    "📢 *Anuncio de registro*\n"
+    "Manda a tu grupo un mensaje con un botón para que la gente se registre en el bot "
+    "y reciba los avisos en su privado.\n\n"
+    "📣 *Difundir un mensaje*\n"
+    "Pulsa el botón y escríbeme lo que quieras (texto, foto, vídeo...). Lo envío a todos "
+    "tus usuarios en tandas para que Telegram no te bloquee. Si te equivocas, puedes pararlo.\n\n"
+    "🗑️ *Vaciar usuarios*\n"
+    "Borra todos los usuarios (para empezar de cero).\n\n"
+    "🔄 *Reiniciar bot*\n"
+    "Reinicia el bot si notas algo raro.\n\n"
+    "_Automático:_ cuando alguien entra a tu grupo se registra solo, cuando sale se le quita "
+    "el acceso, y 3 días antes de caducar se le avisa. Tú no tienes que hacer nada. 🤖"
+)
+
+
+# ========================
+# TEXTO (según lo que se esté esperando)
+# ========================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
         return
-    lines = []
-    for r in users:
-        estado = "✅" if not r["expiry"] or r["expiry"] >= date.today() else "❌"
-        exp = r["expiry"].strftime('%d/%m/%Y') if r["expiry"] else "sin fecha"
-        lines.append(f"{estado} {format_user(r)} — {exp}")
+    esperando = context.user_data.get("esperando")
 
-    chunk = "👥 *Usuarios:*\n\n"
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 4000:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        await update.message.reply_text(chunk, parse_mode="Markdown")
-
-async def anuncio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📲 Regístrate", url=f"https://t.me/{BOT_USERNAME}?start=registro")],
-        [InlineKeyboardButton("📢 Canal", url=CANAL_LINK)]
-    ])
-    await context.bot.send_message(chat_id=GROUP_ID,
-        text="🎯 *¿Quieres recibir apuestas antes que nadie?*\n\nRegístrate y te llegará directo al privado. 🔔",
-        parse_mode="Markdown", reply_markup=kb)
-    await update.message.reply_text("✅ Anuncio enviado")
-
-async def patrocinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💎 Patrocinar", url=CANAL_LINK)]])
-    await context.bot.send_message(chat_id=GROUP_ID,
-        text="💼 *¿Quieres patrocinar el canal?*\n\nContacta con nosotros. 📩",
-        parse_mode="Markdown", reply_markup=kb)
-    await update.message.reply_text("✅ Mensaje enviado")
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    if not context.args or context.args[0] != "CONFIRMAR":
+    if esperando == "broadcast":
+        context.user_data.pop("esperando", None)
+        bid = await next_broadcast_id()
+        asyncio.create_task(broadcast_logic(context.bot, update.message, bid))
+        await asyncio.sleep(0.5)  # dar tiempo a marcar la difusión como activa
         await update.message.reply_text(
-            "⚠️ *¿Seguro que quieres borrar todos los usuarios?*\n\n"
-            "Esta acción no se puede deshacer.\n\n"
-            "Escribe `/reset CONFIRMAR` para ejecutarlo.",
-            parse_mode="Markdown"
-        )
+            f"🚀 *Difusión #{bid} en marcha.* Te voy informando.\n\n"
+            f"Si te equivocaste, pulsa *⏹️ PARAR difusión*.",
+            parse_mode="Markdown", reply_markup=menu_principal())
         return
-    users = await get_all_users()
-    total_antes = len(users)
-    await delete_all_users()
-    await update.message.reply_text(
-        f"🗑️ *Base de datos limpiada*\n\n"
-        f"Se han eliminado *{total_antes}* usuarios.\n"
-        f"El bot está listo para un nuevo mes.",
-        parse_mode="Markdown"
-    )
 
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    await update.message.reply_text(
-        "📋 *Comandos disponibles:*\n\n"
-        "✉️ *Escribir cualquier mensaje* → broadcast en paralelo\n"
-        "🖼️ Foto/vídeo/doc/audio/voz/sticker → también se manda a todos\n\n"
-        "🎟️ *Accesos:*\n"
-        "/activar CODIGO → activar acceso con código\n"
-        "/generar N D → genera N códigos de D días\n"
-        "/codigos → ver todos los códigos\n"
-        "/extender ID DIAS → ampliar acceso de un usuario\n"
-        "/expulsar ID → desactivar acceso de un usuario\n\n"
-        "📊 *Usuarios:*\n"
-        "/total → total y activos/caducados\n"
-        "/lista → ver todos los usuarios con estado\n"
-        "/reset CONFIRMAR → eliminar todos los usuarios\n\n"
-        "📢 *Canal:*\n"
-        "/anuncio → manda botón de registro al grupo\n"
-        "/patrocinar → manda mensaje de patrocinio\n\n"
-        "🔧 *Otros:*\n"
-        "/id → ver el ID de un chat\n"
-        "/ayuda → ver esta lista",
-        parse_mode="Markdown"
-    )
+    # Sin nada esperando → mostrar el menú
+    await update.message.reply_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
 
+
+# ========================
+# ARRANQUE
+# ========================
 async def on_startup(app):
-    global GROUP_ID
+    global GROUP_ID, ADMIN_ID, ADMINS, BOT_USERNAME
     await init_db()
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM config WHERE key = 'group_id'")
-        if row:
-            GROUP_ID = int(row["value"])
+    g = await cfg_get("group_id")
+    if g:
+        GROUP_ID = int(g)
+    a = await cfg_get("admin_id")
+    if a:
+        ADMIN_ID = int(a)
+        ADMINS = [ADMIN_ID]
+    me = await app.bot.get_me()
+    BOT_USERNAME = me.username
     asyncio.create_task(daily_expiry_check(app.bot))
-    await notify_admins(app.bot, "🟢 *Bot iniciado correctamente*\n\nEl bot está activo y listo.")
+    if DEVELOPER_ID:
+        try:
+            await app.bot.send_message(DEVELOPER_ID, "🟢 Bot iniciado.")
+        except Exception:
+            pass
+
+
+def construir_app():
+    app = ApplicationBuilder().token(TOKEN).post_init(on_startup).build()
+    app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(mi_estado, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", start))
+    app.add_handler(CallbackQueryHandler(boton))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND, handle_text))
+    return app
+
 
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    app = ApplicationBuilder().token(TOKEN).post_init(on_startup).build()
-    app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(ChatMemberHandler(mi_estado,    ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(CallbackQueryHandler(confirmar_grupo, pattern="^setgroup_"))
-    app.add_handler(CommandHandler("start",       start))
-    app.add_handler(CommandHandler("activar",     activar))
-    app.add_handler(CommandHandler("id",          get_id))
-    app.add_handler(CommandHandler("total",       total))
-    app.add_handler(CommandHandler("lista",       lista))
-    app.add_handler(CommandHandler("anuncio",     anuncio))
-    app.add_handler(CommandHandler("patrocinar",  patrocinar))
-    app.add_handler(CommandHandler("reset",       reset))
-    app.add_handler(CommandHandler("ayuda",       ayuda))
-    app.add_handler(CommandHandler("generar",     generar))
-    app.add_handler(CommandHandler("codigos",     codigos_cmd))
-    app.add_handler(CommandHandler("extender",    extender))
-    app.add_handler(CommandHandler("expulsar",    expulsar))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND, encolar))
-
-    print("🤖 Bot corriendo...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    import time as _time
+    print("🤖 Bot plantilla corriendo...")
+    # Si justo tras un redeploy queda otra instancia polleando unos segundos, habría
+    # un conflicto puntual. En vez de morir, reconstruimos la app y reintentamos hasta
+    # que la instancia vieja se apaga (drop_pending_updates ayuda a tomar el control).
+    while True:
+        try:
+            construir_app().run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            break
+        except Exception as e:
+            print(f"⚠️ Polling cortado ({type(e).__name__}: {e}). Reintento en 20s...")
+            _time.sleep(20)
