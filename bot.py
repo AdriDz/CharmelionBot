@@ -35,6 +35,9 @@ RAILWAY_PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID", "")
 RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "")
 RAILWAY_ENV_ID     = os.environ.get("RAILWAY_ENV_ID", "")
 
+ORCHESTRATOR_URL    = os.environ.get("ORCHESTRATOR_URL", "")
+STRIPE_CUSTOMER_ID  = os.environ.get("STRIPE_CUSTOMER_ID", "")
+
 ADMINS = [ADMIN_ID] if ADMIN_ID else []
 BOT_USERNAME = ""   # se rellena al arrancar
 db_pool = None
@@ -42,6 +45,9 @@ db_pool = None
 # Estado de la difusión en curso (para poder pararla)
 _difusion_activa = False
 _difusion_cancelar = False
+# Referencia fuerte a la tarea de difusión: sin esto, el recolector de basura de
+# Python puede matar la tarea durante la espera entre tandas (se quedaría en la 1).
+_difusion_task = None
 
 
 # ========================
@@ -124,7 +130,7 @@ async def notify_admins(bot, message, reply_markup=None):
     for admin_id in ADMINS:
         try:
             await bot.send_message(chat_id=admin_id, text=message,
-                                   parse_mode="Markdown", reply_markup=reply_markup)
+                                   parse_mode="HTML", reply_markup=reply_markup)
         except Exception:
             pass
 
@@ -182,6 +188,10 @@ def menu_principal():
         [InlineKeyboardButton("🔄 Reiniciar bot",   callback_data="reiniciar")],
         [InlineKeyboardButton("❓ Cómo funciona",   callback_data="ayuda")],
     ]
+    if ORCHESTRATOR_URL and STRIPE_CUSTOMER_ID:
+        filas.append([InlineKeyboardButton(
+            "❌ Cancelar suscripción",
+            url=f"{ORCHESTRATOR_URL}/portal?cid={STRIPE_CUSTOMER_ID}")])
     return InlineKeyboardMarkup(filas)
 
 
@@ -190,10 +200,10 @@ def boton_volver():
 
 
 TEXTO_MENU = (
-    "🤖 *Panel de control*\n\n"
+    "🤖 <b>Panel de control</b>\n\n"
     "Elige una opción 👇\n"
-    "_Todo se maneja con los botones. Para difundir un mensaje, pulsa «Difundir» "
-    "y escríbeme lo que quieras enviar._"
+    "<i>Todo se maneja con los botones. Para difundir un mensaje, pulsa «Difundir» "
+    "y escríbeme lo que quieras enviar.</i>"
 )
 
 
@@ -205,9 +215,14 @@ async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.my_chat_member
     if not result:
         return
+    chat = result.chat
+    # Ignorar chats privados: cuando un usuario hace /start o (des)bloquea el bot
+    # también llega un my_chat_member, pero eso NO es "me añadieron a un grupo".
+    # Sin este filtro, el bot tomaría el chat privado como grupo y machacaría GROUP_ID.
+    if chat.type not in ("group", "supergroup", "channel"):
+        return
     old = result.old_chat_member.status
     new = result.new_chat_member.status
-    chat = result.chat
     quien = result.from_user
 
     if old in ("left", "kicked") and new in ("member", "administrator"):
@@ -225,9 +240,9 @@ async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=(f"✅ *¡Bot configurado!*\n\n📛 Grupo: *{chat.title}*\n\n"
+                    text=(f"✅ <b>¡Bot configurado!</b>\n\n📛 Grupo: <b>{chat.title}</b>\n\n"
                           f"Ya está todo listo. Aquí tienes tu panel 👇"),
-                    parse_mode="Markdown", reply_markup=menu_principal())
+                    parse_mode="HTML", reply_markup=menu_principal())
             except Exception:
                 pass
 
@@ -235,9 +250,9 @@ async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=DEVELOPER_ID,
-                    text=(f"🟢 *Bot activado por cliente*\n📛 {chat.title}\n"
-                          f"🆔 `{chat.id}`\n👤 Admin: `{ADMIN_ID}`"),
-                    parse_mode="Markdown")
+                    text=(f"🟢 <b>Bot activado por cliente</b>\n📛 {chat.title}\n"
+                          f"🆔 <code>{chat.id}</code>\n👤 Admin: <code>{ADMIN_ID}</code>"),
+                    parse_mode="HTML")
             except Exception:
                 pass
 
@@ -246,8 +261,8 @@ async def mi_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=DEVELOPER_ID,
-                    text=f"⚠️ *Bot eliminado de un grupo*\n📛 {chat.title}",
-                    parse_mode="Markdown")
+                    text=f"⚠️ <b>Bot eliminado de un grupo</b>\n📛 {chat.title}",
+                    parse_mode="HTML")
             except Exception:
                 pass
 
@@ -267,10 +282,10 @@ async def daily_expiry_check(bot):
             try:
                 await bot.send_message(
                     chat_id=u["user_id"],
-                    text=(f"⚠️ *Tu acceso expira en 3 días*\n\n"
-                          f"📅 Fecha: *{u['expiry'].strftime('%d/%m/%Y')}*\n\n"
+                    text=(f"⚠️ <b>Tu acceso expira en 3 días</b>\n\n"
+                          f"📅 Fecha: <b>{u['expiry'].strftime('%d/%m/%Y')}</b>\n\n"
                           f"Contacta con el admin para renovar."),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
             except Exception:
                 pass
 
@@ -294,22 +309,22 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=user.id,
-                text=(f"✅ *¡Bienvenido al VIP!*\n\n"
-                      f"📅 Acceso válido hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
+                text=(f"✅ <b>¡Bienvenido al VIP!</b>\n\n"
+                      f"📅 Acceso válido hasta el <b>{expiry.strftime('%d/%m/%Y')}</b>\n\n"
                       f"Recibirás los avisos aquí directamente. 🔔"),
-                parse_mode="Markdown")
+                parse_mode="HTML")
         except Exception:
             pass
         await notify_admins(context.bot,
-            f"🆕 *Nuevo miembro*\n👤 {user.full_name} (@{user.username or 'sin @'})\n"
-            f"🆔 `{user.id}`\n📅 Hasta: *{expiry.strftime('%d/%m/%Y')}*")
+            f"🆕 <b>Nuevo miembro</b>\n👤 {user.full_name} (@{user.username or 'sin @'})\n"
+            f"🆔 <code>{user.id}</code>\n📅 Hasta: <b>{expiry.strftime('%d/%m/%Y')}</b>")
 
     elif old == "member" and new in ("left", "kicked"):
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE users SET expiry=$1 WHERE user_id=$2",
                                date.today() - timedelta(days=1), user.id)
         await notify_admins(context.bot,
-            f"🚪 *Miembro salido*\n👤 {user.full_name} (@{user.username or 'sin @'})\n🆔 `{user.id}`")
+            f"🚪 <b>Miembro salido</b>\n👤 {user.full_name} (@{user.username or 'sin @'})\n🆔 <code>{user.id}</code>")
 
 
 # ========================
@@ -334,13 +349,13 @@ async def broadcast_logic(bot, msg, broadcast_id):
     tanda_size, espera = 5, 180
 
     await notify_admins(bot,
-        f"🚀 *Difusión #{broadcast_id} iniciada* ({total} activos)\n📦 Tandas de 5 cada 3 min\n"
-        f"_Puedes pararla desde el menú con «Parar difusión»._")
+        f"🚀 <b>Difusión #{broadcast_id} iniciada</b> ({total} activos)\n📦 Tandas de 5 cada 3 min\n"
+        f"<i>Puedes pararla desde el menú con «Parar difusión».</i>")
 
     for i in range(0, total, tanda_size):
         if _difusion_cancelar:
             await notify_admins(bot,
-                f"⏹️ *Difusión #{broadcast_id} detenida.*\n✅ Enviados: *{enviados}* de {total}")
+                f"⏹️ <b>Difusión #{broadcast_id} detenida.</b>\n✅ Enviados: <b>{enviados}</b> de {total}")
             _difusion_activa = False
             return
         tanda = users[i:i + tanda_size]
@@ -386,10 +401,10 @@ async def broadcast_logic(bot, msg, broadcast_id):
     _difusion_activa = False
     if _difusion_cancelar:
         await notify_admins(bot,
-            f"⏹️ *Difusión #{broadcast_id} detenida.*\n✅ Enviados: *{enviados}* de {total}")
+            f"⏹️ <b>Difusión #{broadcast_id} detenida.</b>\n✅ Enviados: <b>{enviados}</b> de {total}")
     else:
         await notify_admins(bot,
-            f"🏁 *Difusión #{broadcast_id} finalizada*\n✅ {enviados} | ❌ {fallidos} | 👥 {total}")
+            f"🏁 <b>Difusión #{broadcast_id} finalizada</b>\n✅ {enviados} | ❌ {fallidos} | 👥 {total}")
 
 
 # ========================
@@ -400,7 +415,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Admin → panel de botones
     if user.id in ADMINS:
-        await update.message.reply_text(TEXTO_MENU, parse_mode="Markdown",
+        await update.message.reply_text(TEXTO_MENU, parse_mode="HTML",
                                         reply_markup=menu_principal())
         return
 
@@ -410,7 +425,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = await conn.fetchrow("SELECT expiry FROM users WHERE user_id=$1", user.id)
         exp = row["expiry"].strftime('%d/%m/%Y') if row and row["expiry"] else "este mes"
         await update.message.reply_text(
-            f"✅ *Ya tienes acceso activo.*\n\n📅 Expira el *{exp}*", parse_mode="Markdown")
+            f"✅ <b>Ya tienes acceso activo.</b>\n\n📅 Expira el <b>{exp}</b>", parse_mode="HTML")
         return
 
     en_grupo = False
@@ -425,12 +440,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry = date.today() + timedelta(days=31)
         await register_user(user, expiry)
         await update.message.reply_text(
-            f"✅ *¡Registrado correctamente!*\n\n📅 Acceso hasta el *{expiry.strftime('%d/%m/%Y')}*\n\n"
-            f"A partir de ahora recibirás los avisos aquí. 🔔", parse_mode="Markdown")
+            f"✅ <b>¡Registrado correctamente!</b>\n\n📅 Acceso hasta el <b>{expiry.strftime('%d/%m/%Y')}</b>\n\n"
+            f"A partir de ahora recibirás los avisos aquí. 🔔", parse_mode="HTML")
     else:
         await update.message.reply_text(
-            "🔐 *Acceso restringido.*\n\nNecesitas ser miembro del canal VIP para registrarte.",
-            parse_mode="Markdown")
+            "🔐 <b>Acceso restringido.</b>\n\nNecesitas ser miembro del canal VIP para registrarte.",
+            parse_mode="HTML")
 
 
 # ========================
@@ -445,16 +460,16 @@ async def boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu":
         context.user_data.pop("esperando", None)
-        await query.edit_message_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
+        await query.edit_message_text(TEXTO_MENU, parse_mode="HTML", reply_markup=menu_principal())
 
     elif data == "usuarios":
         users = await get_all_users()
         activos = sum(1 for r in users if not r["expiry"] or r["expiry"] >= date.today())
-        cab = (f"👥 *Tus usuarios*\n\n"
-               f"Total: *{len(users)}*  ·  ✅ Activos: *{activos}*  ·  ❌ Caducados: *{len(users)-activos}*\n\n")
+        cab = (f"👥 <b>Tus usuarios</b>\n\n"
+               f"Total: <b>{len(users)}</b>  ·  ✅ Activos: <b>{activos}</b>  ·  ❌ Caducados: <b>{len(users)-activos}</b>\n\n")
         if not users:
-            await query.edit_message_text(cab + "_Aún no hay usuarios registrados._",
-                                          parse_mode="Markdown", reply_markup=boton_volver())
+            await query.edit_message_text(cab + "<i>Aún no hay usuarios registrados.</i>",
+                                          parse_mode="HTML", reply_markup=boton_volver())
             return
         lineas = []
         for r in users[:50]:
@@ -463,7 +478,7 @@ async def boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lineas.append(f"{estado} {format_user(r)} — {exp}")
         extra = f"\n\n_…y {len(users)-50} más_" if len(users) > 50 else ""
         await query.edit_message_text(cab + "\n".join(lineas) + extra,
-                                      parse_mode="Markdown", reply_markup=boton_volver())
+                                      parse_mode="HTML", reply_markup=boton_volver())
 
     elif data == "anuncio":
         if not GROUP_ID:
@@ -476,9 +491,9 @@ async def boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=GROUP_ID,
-                text=("📣 *¿Quieres recibir los avisos directamente en tu privado?*\n\n"
+                text=("📣 <b>¿Quieres recibir los avisos directamente en tu privado?</b>\n\n"
                       "Pulsa el botón y quedarás registrado en el bot. 🔔"),
-                parse_mode="Markdown", reply_markup=kb)
+                parse_mode="HTML", reply_markup=kb)
             await query.edit_message_text("✅ Anuncio enviado a tu grupo.", reply_markup=boton_volver())
         except Exception as e:
             await query.edit_message_text(f"❌ No pude enviarlo: {e}", reply_markup=boton_volver())
@@ -486,25 +501,25 @@ async def boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "difundir":
         context.user_data["esperando"] = "broadcast"
         await query.edit_message_text(
-            "📣 *Difundir un mensaje*\n\nEscríbeme ahora el mensaje que quieres enviar a todos "
+            "📣 <b>Difundir un mensaje</b>\n\nEscríbeme ahora el mensaje que quieres enviar a todos "
             "tus usuarios. Puede ser texto, foto, vídeo, audio... Lo mando yo en tandas.\n\n"
-            "_(o pulsa Menú para cancelar)_",
-            parse_mode="Markdown", reply_markup=boton_volver())
+            "<i>(o pulsa Menú para cancelar)</i>",
+            parse_mode="HTML", reply_markup=boton_volver())
 
     elif data == "vaciar":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚠️ Sí, vaciar todo", callback_data="vaciar_ok")],
             [InlineKeyboardButton("↩️ Cancelar", callback_data="menu")]])
         await query.edit_message_text(
-            "🗑️ *¿Seguro que quieres borrar TODOS los usuarios?*\n\nEsto no se puede deshacer.",
-            parse_mode="Markdown", reply_markup=kb)
+            "🗑️ <b>¿Seguro que quieres borrar TODOS los usuarios?</b>\n\nEsto no se puede deshacer.",
+            parse_mode="HTML", reply_markup=kb)
 
     elif data == "vaciar_ok":
         users = await get_all_users()
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM users")
         await query.edit_message_text(
-            f"🗑️ Hecho. Eliminados *{len(users)}* usuarios.", parse_mode="Markdown",
+            f"🗑️ Hecho. Eliminados <b>{len(users)}</b> usuarios.", parse_mode="HTML",
             reply_markup=boton_volver())
 
     elif data == "parar":
@@ -527,25 +542,25 @@ async def boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, reply_markup=boton_volver())
 
     elif data == "ayuda":
-        await query.edit_message_text(AYUDA, parse_mode="Markdown", reply_markup=boton_volver())
+        await query.edit_message_text(AYUDA, parse_mode="HTML", reply_markup=boton_volver())
 
 
 AYUDA = (
-    "❓ *Cómo funciona tu bot*\n\n"
+    "❓ <b>Cómo funciona tu bot</b>\n\n"
     "Tu bot gestiona tu canal VIP solo. Esto es lo que hace:\n\n"
-    "👥 *Mis usuarios*\n"
+    "👥 <b>Mis usuarios</b>\n"
     "Ve cuánta gente tienes, quién está activo y quién caducó.\n\n"
-    "📢 *Anuncio de registro*\n"
+    "📢 <b>Anuncio de registro</b>\n"
     "Manda a tu grupo un mensaje con un botón para que la gente se registre en el bot "
     "y reciba los avisos en su privado.\n\n"
-    "📣 *Difundir un mensaje*\n"
+    "📣 <b>Difundir un mensaje</b>\n"
     "Pulsa el botón y escríbeme lo que quieras (texto, foto, vídeo...). Lo envío a todos "
     "tus usuarios en tandas para que Telegram no te bloquee. Si te equivocas, puedes pararlo.\n\n"
-    "🗑️ *Vaciar usuarios*\n"
+    "🗑️ <b>Vaciar usuarios</b>\n"
     "Borra todos los usuarios (para empezar de cero).\n\n"
-    "🔄 *Reiniciar bot*\n"
+    "🔄 <b>Reiniciar bot</b>\n"
     "Reinicia el bot si notas algo raro.\n\n"
-    "_Automático:_ cuando alguien entra a tu grupo se registra solo, cuando sale se le quita "
+    "<i>Automático:</i> cuando alguien entra a tu grupo se registra solo, cuando sale se le quita "
     "el acceso, y 3 días antes de caducar se le avisa. Tú no tienes que hacer nada. 🤖"
 )
 
@@ -561,16 +576,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if esperando == "broadcast":
         context.user_data.pop("esperando", None)
         bid = await next_broadcast_id()
-        asyncio.create_task(broadcast_logic(context.bot, update.message, bid))
+        global _difusion_task
+        # Guardar la referencia en un global para que el recolector de basura NO
+        # mate la tarea durante las esperas entre tandas.
+        _difusion_task = asyncio.create_task(broadcast_logic(context.bot, update.message, bid))
         await asyncio.sleep(0.5)  # dar tiempo a marcar la difusión como activa
         await update.message.reply_text(
-            f"🚀 *Difusión #{bid} en marcha.* Te voy informando.\n\n"
-            f"Si te equivocaste, pulsa *⏹️ PARAR difusión*.",
-            parse_mode="Markdown", reply_markup=menu_principal())
+            f"🚀 <b>Difusión #{bid} en marcha.</b> Te voy informando.\n\n"
+            f"Si te equivocaste, pulsa <b>⏹️ PARAR difusión</b>.",
+            parse_mode="HTML", reply_markup=menu_principal())
         return
 
     # Sin nada esperando → mostrar el menú
-    await update.message.reply_text(TEXTO_MENU, parse_mode="Markdown", reply_markup=menu_principal())
+    await update.message.reply_text(TEXTO_MENU, parse_mode="HTML", reply_markup=menu_principal())
 
 
 # ========================
